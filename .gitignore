@@ -1,0 +1,51 @@
+# Build artifacts
+build/
+out/
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake-build-*/
+compile_commands.json
+
+# vcpkg
+vcpkg_installed/
+.vcpkg-root
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+dist/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.cache/
+.clangd/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Profiling artifacts
+*.tracy
+
+# Headless simulation artifacts
+*.trajectory
+*.metrics.json
+artifacts/

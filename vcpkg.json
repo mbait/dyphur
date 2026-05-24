@@ -1,0 +1,27 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "dyphur",
+  "version": "0.0.1",
+  "description": "GPU-first rigid-body physics framework for robotics simulation.",
+  "license": "Apache-2.0",
+  "dependencies": [
+    "eigen3",
+    "spdlog",
+    "fmt",
+    "pugixml",
+    {
+      "name": "catch2",
+      "version>=": "3.4.0"
+    },
+    "nanobind",
+    "tracy"
+  ],
+  "features": {
+    "scene": {
+      "description": "SDF/URDF scene loading (Phase 3).",
+      "dependencies": [
+        "sdformat14"
+      ]
+    }
+  }
+}

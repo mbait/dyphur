@@ -1,0 +1,171 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CONFIGURATION_TYPES": "Debug;Release;RelWithDebInfo",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-linux",
+        "CMAKE_CROSS_CONFIGS": "all",
+        "CMAKE_DEFAULT_BUILD_TYPE": "Debug"
+      },
+      "environment": {
+        "CMAKE_GENERATOR": "Ninja Multi-Config"
+      }
+    },
+    {
+      "name": "cuda",
+      "inherits": "base",
+      "displayName": "CUDA backend (AdaptiveCpp -> nvptx)",
+      "cacheVariables": {
+        "DYPHUR_BACKEND": "CUDA"
+      }
+    },
+    {
+      "name": "hip",
+      "inherits": "base",
+      "displayName": "HIP backend (AdaptiveCpp -> ROCm)",
+      "cacheVariables": {
+        "DYPHUR_BACKEND": "HIP"
+      }
+    },
+    {
+      "name": "omp",
+      "inherits": "base",
+      "displayName": "CPU backend (AdaptiveCpp -> OpenMP)",
+      "cacheVariables": {
+        "DYPHUR_BACKEND": "OMP"
+      }
+    },
+    {
+      "name": "omp-asan",
+      "inherits": "omp",
+      "displayName": "CPU backend + AddressSanitizer",
+      "cacheVariables": {
+        "DYPHUR_SANITIZER": "ASan"
+      }
+    },
+    {
+      "name": "omp-ubsan",
+      "inherits": "omp",
+      "displayName": "CPU backend + UndefinedBehaviorSanitizer",
+      "cacheVariables": {
+        "DYPHUR_SANITIZER": "UBSan"
+      }
+    },
+    {
+      "name": "omp-tsan",
+      "inherits": "omp",
+      "displayName": "CPU backend + ThreadSanitizer",
+      "cacheVariables": {
+        "DYPHUR_SANITIZER": "TSan"
+      }
+    },
+    {
+      "name": "dev",
+      "inherits": "cuda",
+      "displayName": "Local dev preset (CUDA, Debug default, compile_commands.json on)",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "cuda-debug",    "configurePreset": "cuda", "configuration": "Debug" },
+    { "name": "cuda-release",  "configurePreset": "cuda", "configuration": "Release" },
+    { "name": "cuda-relwithdebinfo", "configurePreset": "cuda", "configuration": "RelWithDebInfo" },
+    { "name": "hip-debug",     "configurePreset": "hip",  "configuration": "Debug" },
+    { "name": "hip-release",   "configurePreset": "hip",  "configuration": "Release" },
+    { "name": "omp-debug",     "configurePreset": "omp",  "configuration": "Debug" },
+    { "name": "omp-release",   "configurePreset": "omp",  "configuration": "Release" },
+    { "name": "omp-asan-debug",  "configurePreset": "omp-asan",  "configuration": "Debug" },
+    { "name": "omp-ubsan-debug", "configurePreset": "omp-ubsan", "configuration": "Debug" },
+    { "name": "omp-tsan-debug",  "configurePreset": "omp-tsan",  "configuration": "Debug" },
+    { "name": "dev-debug",     "configurePreset": "dev",  "configuration": "Debug" }
+  ],
+  "testPresets": [
+    {
+      "name": "cuda-smoke",
+      "configurePreset": "cuda",
+      "configuration": "Debug",
+      "filter": { "include": { "label": "smoke" } },
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "cuda-full",
+      "configurePreset": "cuda",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "hip-full",
+      "configurePreset": "hip",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "omp-full",
+      "configurePreset": "omp",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "determinism",
+      "configurePreset": "cuda",
+      "configuration": "Release",
+      "filter": { "include": { "label": "determinism" } },
+      "output": { "outputOnFailure": true }
+    }
+  ],
+  "workflowPresets": [
+    {
+      "name": "dev",
+      "steps": [
+        { "type": "configure", "name": "dev" },
+        { "type": "build",     "name": "dev-debug" },
+        { "type": "test",      "name": "cuda-smoke" }
+      ]
+    },
+    {
+      "name": "ci-linux-cuda",
+      "steps": [
+        { "type": "configure", "name": "cuda" },
+        { "type": "build",     "name": "cuda-release" },
+        { "type": "test",      "name": "cuda-full" }
+      ]
+    },
+    {
+      "name": "ci-linux-hip",
+      "steps": [
+        { "type": "configure", "name": "hip" },
+        { "type": "build",     "name": "hip-release" },
+        { "type": "test",      "name": "hip-full" }
+      ]
+    },
+    {
+      "name": "ci-linux-cpu",
+      "steps": [
+        { "type": "configure", "name": "omp" },
+        { "type": "build",     "name": "omp-release" },
+        { "type": "test",      "name": "omp-full" }
+      ]
+    },
+    {
+      "name": "ci-determinism",
+      "steps": [
+        { "type": "configure", "name": "cuda" },
+        { "type": "build",     "name": "cuda-release" },
+        { "type": "test",      "name": "determinism" }
+      ]
+    }
+  ]
+}

@@ -23,7 +23,7 @@ Rendering, sensor noise simulation, soft bodies, fluids, mobile/embedded GPU tar
 - CMake ≥ 3.25
 - Ninja
 - A C++20 compiler (GCC 12+, Clang 15+)
-- vcpkg (installed; `VCPKG_ROOT` set)
+- vcpkg (bundled as a git submodule; no `VCPKG_ROOT` needed)
 - AdaptiveCpp (installed system-wide; not via vcpkg)
 - For the CUDA backend: NVIDIA driver + CUDA Toolkit (development on RTX 3060, compute capability 8.6)
 - For the HIP backend: ROCm
@@ -32,6 +32,9 @@ Rendering, sensor noise simulation, soft bodies, fluids, mobile/embedded GPU tar
 ## Quick start (once Phase 0 is implemented)
 
 ```sh
+# After cloning, initialize vcpkg
+git submodule update --init
+
 # Local development loop (Debug build, CUDA backend, smoke tests)
 cmake --workflow --preset=dev
 

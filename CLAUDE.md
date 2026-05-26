@@ -1,12 +1,61 @@
-# dyphur — Project Context for Claude
+# CLAUDE.md
 
-This file is the canonical entry point for any Claude session resuming work on this project. Read it first.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What this is
 
 `dyphur` is a GPU-first rigid-body physics framework for robotics simulation. The full design rationale, phased roadmap, and verification gates live in [docs/PLAN.md](docs/PLAN.md). **Always read `docs/PLAN.md` before doing nontrivial work.**
 
 Project owner: Alexander Solovets (asolovets@gmail.com). Solo, full-time.
+
+## Build and test
+
+Requires: AdaptiveCpp system-installed with LLVM + CUDA/ROCm SDKs. CMake ≥ 3.25, Ninja. vcpkg is a git submodule (`vcpkg/`) — run `git submodule update --init` after cloning.
+
+```bash
+# Local dev loop (CUDA, Debug, smoke tests)
+cmake --workflow --preset=dev
+
+# CI-equivalent workflows
+cmake --workflow --preset=ci-linux-cuda
+cmake --workflow --preset=ci-linux-hip
+cmake --workflow --preset=ci-linux-cpu
+cmake --workflow --preset=ci-determinism
+
+# Build a specific config without running tests
+cmake --preset=cuda
+cmake --build build/cuda --config Release
+
+# Run a single test by name (after building)
+ctest --test-dir build/cuda --build-config Debug -R <test-name> --output-on-failure
+
+# Run only smoke tests
+ctest --test-dir build/cuda --build-config Debug -L smoke --output-on-failure
+
+# Run the device-header allow-list lint
+cmake --build build/cuda --target dyphur-lint-device-headers
+```
+
+Build directories are `build/<preset-name>/`. The `dev` preset exports `compile_commands.json` for clangd.
+
+## Module architecture
+
+```
+compute/    — thin SYCL/AdaptiveCpp abstraction (Device, Buffer<T>, parallel_for,
+              reduce, sort_by_key, atomic_add, Stream, Event)
+core/       — physics core; depends on compute/. Host math via Eigen; device math
+              via hand-rolled SoA types in core/include/core/math/.
+scene/      — SDF/URDF loader, scene graph, BVH build (Phase 3+); depends on core/
+bindings/   — nanobind Python module (enabled when implemented)
+examples/   — headless executables; stress_test_blocks is the v0.1 demo target
+tools/viz/  — standalone replay viewer; manually invoked, never on CI path
+```
+
+CMake targets: `dyphur::compute`, `dyphur::core`, `dyphur::scene`. All currently INTERFACE (header-only stubs); sources land in Phases 0–1.
+
+CMake helpers (from `cmake/DeterminismCI.cmake`):
+- `dyphur_add_smoke_test(target)` — registers a test with label `smoke`
+- `dyphur_add_determinism_test(target)` — registers a test with label `determinism`
 
 ## Locked decisions (do not relitigate without explicit user request)
 
@@ -33,27 +82,20 @@ These were debated extensively in the planning phase and are settled:
 1. **SoA / AoSoA everywhere in hot paths.** No AoS data crosses into a kernel.
 2. **Solver is an interface, not an implementation.** The core ships with XPBD; alternates must be addable without touching the rest of the physics core.
 3. **Determinism is a CI gate, not a hope.** Every PR runs a golden-trace regression.
-4. **Headless-first.** All tests, benchmarks, determinism checks, and demos run without a display. The single exception is the standalone visualization tool in `tools/viz/`, which a human invokes manually against state-trajectory dumps. No "build it and look at it" verification.
-5. **Dependency boundary.** Third-party C++ libraries fall into four roles (see `docs/PLAN.md § Dependency Policy`). Kernel code only sees the device-safe allow-list — CI-enforced.
-6. **The only physics-related thing we may not reuse is entire physics engines or their solvers.** Everything else (math, geometry, collision-detection algorithms like GJK/EPA, BVH builders, asset loaders) is fair game.
+4. **Headless-first.** All tests, benchmarks, determinism checks, and demos run without a display. The single exception is the standalone visualization tool in `tools/viz/`, which a human invokes manually against state-trajectory dumps.
+5. **Dependency boundary.** Kernel code only sees the device-safe allow-list in `cmake/DependencyAllowlist.cmake`. Forbidden in kernels: STL containers, exceptions, virtual functions, dynamic allocation, file I/O, Eigen.
+6. **The only physics-related thing we may not reuse is entire physics engines or their solvers.** Everything else (math, geometry, GJK/EPA, BVH builders, asset loaders) is fair game.
 
 ## Current state
 
 - **Phase 0 (Foundations)**: skeleton only. Build system stubs, empty include dirs, smoke tests that pass trivially. No real implementation yet.
 - v0.1 target = end of Phase 1 (rigid-body stress test, 1k+ bodies realtime, headless executable emitting trajectory dump + metrics JSON + determinism hash).
 
-## How to work in this repo
-
-- Local dev loop: `cmake --workflow --preset=dev` (once Phase 0 is implemented).
-- CI-equivalent run: `cmake --workflow --preset=ci-linux-cuda` (or `-hip`, `-cpu`, `-determinism`).
-- Build directories are `build/<preset-name>/`.
-- AdaptiveCpp is **not** a vcpkg dep — it requires a system install (LLVM + CUDA/ROCm SDKs). User installs it per platform docs.
-
 ## What to do when stuck
 
 - For design questions: re-read `docs/PLAN.md`. If still ambiguous, ask the user — do not invent.
 - For build issues: check `cmake/BackendOptions.cmake`, `CMakePresets.json`, and `vcpkg.json` together. They are the source of truth for build configuration.
-- For "should I add this dep / feature / abstraction" questions: default to no. Match the existing minimalism. The user prefers terse, dependency-light code.
+- For "should I add this dep / feature / abstraction" questions: default to no. Match the existing minimalism.
 
 ## Communication style preferences
 

@@ -19,7 +19,8 @@
         "CMAKE_DEFAULT_BUILD_TYPE": "Debug"
       },
       "environment": {
-        "CMAKE_GENERATOR": "Ninja Multi-Config"
+        "CMAKE_GENERATOR": "Ninja Multi-Config",
+        "VCPKG_FORCE_SYSTEM_BINARIES": "1"
       }
     },
     {
@@ -94,6 +95,13 @@
   ],
   "testPresets": [
     {
+      "name": "dev-smoke",
+      "configurePreset": "dev",
+      "configuration": "Debug",
+      "filter": { "include": { "label": "smoke" } },
+      "output": { "outputOnFailure": true }
+    },
+    {
       "name": "cuda-smoke",
       "configurePreset": "cuda",
       "configuration": "Debug",
@@ -132,7 +140,7 @@
       "steps": [
         { "type": "configure", "name": "dev" },
         { "type": "build",     "name": "dev-debug" },
-        { "type": "test",      "name": "cuda-smoke" }
+        { "type": "test",      "name": "dev-smoke" }
       ]
     },
     {

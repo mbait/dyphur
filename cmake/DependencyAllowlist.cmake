@@ -43,6 +43,9 @@ set(DYPHUR_DEVICE_SAFE_HEADERS
     "core/math/math.hpp"
     # Body kernel-facing view (raw pointers + flags; no allocating headers).
     "core/body.hpp"
+    # Kernel-safe AABB and shape type/view (no allocating headers).
+    "core/aabb.hpp"
+    "core/shapes.hpp"
 )
 
 add_custom_target(dyphur-lint-device-headers

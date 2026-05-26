@@ -1,11 +1,15 @@
 add_library(dyphur_core STATIC
     src/body_store.cpp
     src/integrator.cpp
+    src/shapes.cpp
+    src/broadphase.cpp
 )
 add_library(dyphur::core ALIAS dyphur_core)
 add_sycl_to_target(TARGET dyphur_core SOURCES
     src/body_store.cpp
     src/integrator.cpp
+    src/shapes.cpp
+    src/broadphase.cpp
 )
 
 target_include_directories(dyphur_core PUBLIC

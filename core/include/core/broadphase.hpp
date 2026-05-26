@@ -58,7 +58,9 @@ private:
     uint32_t max_pairs_  = 0;
 
     // Bitonic sort input: one entry per body (padded to max_padded_).
-    Buffer<uint32_t> d_morton_;
+    // Key = (morton30 << 32) | body_idx so equal Morton codes sort by body index —
+    // makes the sort stable and the Karras tree deterministic across runs.
+    Buffer<uint64_t> d_morton_;
     Buffer<uint32_t> d_sorted_idx_;  // sorted_idx[k] = original body index of leaf k
 
     // BVH node arrays — total 2*max_bodies-1 nodes:

@@ -5,7 +5,7 @@
 //   <prefix>.metrics.json    step/contact/timing statistics
 //   <prefix>.golden          FNV-1a-64 hash of the final body state (for CI)
 //
-// Usage: stress_test_blocks [out_prefix] [n_frames]
+// Usage: stress_test_blocks [out_prefix] [n_frames] [--cpu]
 
 #include <core/body_store.hpp>
 #include <core/broadphase.hpp>
@@ -41,12 +41,20 @@ int main(int argc, char** argv) {
     std::string prefix  = "stress_test_blocks";
     int         n_frames = 300;
 
-    if (argc >= 2) prefix   = argv[1];
-    if (argc >= 3) n_frames = std::atoi(argv[2]);
+    bool force_cpu = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--cpu") { force_cpu = true; continue; }
+        if (prefix == "stress_test_blocks") prefix = argv[i];
+        else n_frames = std::atoi(argv[i]);
+    }
 
     spdlog::info("dyphur stress_test_blocks: {} frames, prefix='{}'", n_frames, prefix);
 
-    auto dev = Device::default_cpu();
+    Device dev = [&]() -> Device {
+        if (force_cpu) return Device::default_cpu();
+        try { return Device::default_gpu(); }
+        catch (...) { return Device::default_cpu(); }
+    }();
     auto s   = dev.make_stream();
     auto& q  = s.queue();
 
@@ -114,6 +122,7 @@ int main(int argc, char** argv) {
     bs.upload();
     s.wait();
 
+    spdlog::info("Device: {} ({})", dev.name(), dev.is_gpu() ? "GPU" : "CPU");
     spdlog::info("Bodies: {} dynamic + 1 static ground", N_DYN);
 
     // ── Physics objects ───────────────────────────────────────────────────────

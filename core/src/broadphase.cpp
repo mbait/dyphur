@@ -33,17 +33,15 @@ inline uint32_t morton3(uint32_t x, uint32_t y, uint32_t z) {
 }
 
 // Karras 2012: longest-common-prefix length between sorted positions i and j.
+// Keys are (morton30 << 32 | body_idx) — always distinct, no equal-code case.
 // Returns -1 for out-of-bounds queries.
-inline int lbvh_delta(int i, int j, const uint32_t* codes, int n) {
+inline int lbvh_delta(int i, int j, const uint64_t* codes, int n) {
     if (j < 0 || j >= n) return -1;
-    uint32_t ci = codes[i], cj = codes[j];
-    if (ci == cj)
-        return 32 + sycl::clz(static_cast<uint32_t>(i) ^ static_cast<uint32_t>(j));
-    return sycl::clz(ci ^ cj);
+    return static_cast<int>(sycl::clz(codes[i] ^ codes[j]));
 }
 
 // Karras: find the leaf range [lo, hi] covered by internal node i.
-inline void find_range(int i, const uint32_t* codes, int n,
+inline void find_range(int i, const uint64_t* codes, int n,
                        int& lo, int& hi) {
     int d = (lbvh_delta(i, i + 1, codes, n) - lbvh_delta(i, i - 1, codes, n)) >= 0 ? 1 : -1;
     int delta_min = lbvh_delta(i, i - d, codes, n);
@@ -65,7 +63,7 @@ inline void find_range(int i, const uint32_t* codes, int n,
 
 // Find the Morton-code split point within [lo, hi].
 // Returns gamma in [lo, hi-1] such that range [lo, gamma] goes left.
-inline int find_split(int lo, int hi, const uint32_t* codes, int n) {
+inline int find_split(int lo, int hi, const uint64_t* codes, int n) {
     int delta_node = lbvh_delta(lo, hi, codes, n);
     int s    = 0;
     int step = hi - lo;
@@ -126,7 +124,7 @@ void Broadphase::build_and_query(Stream&         s,
         float sx0 = scene_bounds.min_x, sx1 = scene_bounds.max_x;
         float sy0 = scene_bounds.min_y, sy1 = scene_bounds.max_y;
         float sz0 = scene_bounds.min_z, sz1 = scene_bounds.max_z;
-        uint32_t* d_mc  = d_morton_.data();
+        uint64_t* d_mc  = d_morton_.data();
         uint32_t* d_si  = d_sorted_idx_.data();
         const float* px = bodies.pos_x;
         const float* py = bodies.pos_y;
@@ -143,10 +141,11 @@ void Broadphase::build_and_query(Stream&         s,
                 uint32_t qx = static_cast<uint32_t>(tx * 1023.f);
                 uint32_t qy = static_cast<uint32_t>(ty * 1023.f);
                 uint32_t qz = static_cast<uint32_t>(tz * 1023.f);
-                d_mc[i] = morton3(qx, qy, qz);
+                // Embed body index in low 32 bits: stable sort for equal Morton codes.
+                d_mc[i] = ((uint64_t)morton3(qx, qy, qz) << 32) | (uint64_t)i;
                 d_si[i] = static_cast<uint32_t>(i);
             } else {
-                d_mc[i] = ~0u;   // pads sort to the end
+                d_mc[i] = ~0ULL;  // pads sort to the end
                 d_si[i] = ~0u;
             }
         });
@@ -162,7 +161,7 @@ void Broadphase::build_and_query(Stream&         s,
 
     // ── Step 4: Karras tree construction ─────────────────────────────────────
     {
-        const uint32_t* d_codes = d_morton_.data();
+        const uint64_t* d_codes = d_morton_.data();
         int32_t* d_left   = d_left_.data();
         int32_t* d_right  = d_right_.data();
         int32_t* d_parent = d_parent_.data();
@@ -215,7 +214,7 @@ void Broadphase::build_and_query(Stream&         s,
         const BodyView  bv = bodies;
         const ShapeView sv = shapes;
 
-        parallel_for(s, static_cast<size_t>(n), [=](size_t leaf_k) {
+        parallel_for(s, 1u, [=](size_t) { for (size_t leaf_k = 0; leaf_k < static_cast<size_t>(n_int); ++leaf_k) {
             uint32_t body = d_si[leaf_k];
 
             // Compute AABB for this body's shape.
@@ -284,7 +283,7 @@ void Broadphase::build_and_query(Stream&         s,
                 d_mn_z[p] = pmnz;  d_mx_z[p] = pmxz;
                 cur = p;
             }
-        });
+        } }); // end sequential refit loop
     }
 
     // ── Step 7: Traversal — emit overlapping candidate pairs ─────────────────

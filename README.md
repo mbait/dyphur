@@ -40,13 +40,13 @@ One fixed-size frame step: **integrate → broadphase → sort pairs → narrowp
 
 **Integrator**: Symplectic (semi-implicit) Euler. Velocity updated from forces first, then position from velocity. Substep count is a runtime parameter.
 
-**Broadphase**: LBVH (Linear Bounding Volume Hierarchy, Karras 2012). Bodies are quantized to 10-bit Morton codes, sorted by Morton code (bitonic sort), and the binary radix tree is built in a single parallel kernel. AABBs are refitted bottom-up with per-node atomic flags (acquire-release). Traversal emits overlapping candidate pairs (leaf_i < leaf_j) using the BVH from each leaf as a query. Pairs are sorted by canonical `(a,b)` key after collection to ensure deterministic downstream ordering.
+**Broadphase**: LBVH (Linear Bounding Volume Hierarchy, Karras 2012). Bodies are quantized to 10-bit Morton codes. Each sort key is the 64-bit value `(morton30 << 32) | body_idx`, which makes the bitonic sort a stable sort — equal Morton codes (bodies at the same quantization cell) are always ordered by body index, giving a fully deterministic tree structure. AABBs are refitted bottom-up sequentially (single work-item) to guarantee consistent results across GPU backends; empirical testing showed that the acquire-release semantics of `seq_cst` atomics with `memory_scope::device` are insufficient for the non-atomic AABB reads/writes under CUDA's actual memory model. Traversal emits overlapping candidate pairs (leaf_i < leaf_j) from each leaf as a parallel BVH query; pairs are then sorted by canonical `(a,b)` key to produce a deterministic ordered list for the narrowphase.
 
 **Narrowphase**: Per-pair SAT-based contact detection, processed sequentially (single work-item) over the sorted pair list for determinism. Supports sphere–sphere, sphere–box, and box–box. Box–box uses 15 SAT axes (3 face normals × 2 + 9 edge–edge cross products) and generates up to 4 vertex-face contact points per pair via a face-area heuristic: the larger body's face is always chosen as the reference so that the smaller body's vertices (which lie within the larger face's footprint) are tested, avoiding the zero-contact failure mode that occurs when a small box sits on a large ground plane.
 
 **Solver**: Extended Position-Based Dynamics (XPBD, Müller et al. 2020). Sequential Gauss-Seidel, single GPU work-item for determinism. Full rigid-body angular response: generalized inverse mass includes the angular term `(r×n)·(I_world⁻¹(r×n))` where `I_world⁻¹ = R·I_body⁻¹·Rᵀ`. Quaternion corrections applied each iteration, followed by re-normalization. Zero-restitution velocity correction zeroes the normal relative velocity at contact. Per-contact accumulated lambda prevents multi-iteration over-correction when a body pair has several contact points.
 
-**Determinism**: Achieved by (1) Morton-code ordering of the LBVH, (2) bitonic sort of broadphase pairs by `(a,b)` key, (3) sequential narrowphase processing in sorted-pair order, and (4) single-work-item XPBD with fixed contact traversal order. Same build + same hardware → bit-identical final state hash across runs.
+**Determinism**: Achieved by (1) stable Morton-code sort (64-bit key embedding body index as tiebreaker), (2) sequential single-work-item AABB refit, (3) bitonic sort of broadphase pairs by `(a,b)` key, (4) sequential single-work-item narrowphase over sorted pairs, and (5) single-work-item XPBD with fixed contact traversal order. Same build + same hardware → bit-identical final state hash across runs. CPU and GPU hashes differ (expected: different FP unit behavior, FTZ on GPU).
 
 ### Output format (`stress_test_blocks`)
 
@@ -65,6 +65,7 @@ Benchmark: `stress_test_blocks` — 1 024 dynamic boxes (0.4 m half-extent, 1 kg
 | Processing Unit | Backend | Bodies | Avg contacts/frame | FPS | Realtime factor | Deterministic |
 |---|---|---|---|---|---|---|
 | Intel Xeon E5-2667 v4 @ 3.20 GHz | OpenMP (CPU) | 1 025 | 2 615 | 254 | 4.24× | yes (`7168a504ac96d97e`) |
+| NVIDIA GeForce RTX 3060 (sm_86) | CUDA / AdaptiveCpp SSCP | 1 025 | 2 599 | 83 | 1.39× | yes (`db4db5b2b5c6a8e4`) |
 
 ## Requirements
 
@@ -91,6 +92,11 @@ cmake --workflow --preset=dev
 cmake --preset=omp
 cmake --build build/omp --config Release --target stress_test_blocks
 ./build/omp/examples/stress_test_blocks/Release/stress_test_blocks
+
+# Run on NVIDIA GPU (AdaptiveCpp SSCP generic target; selects GPU automatically)
+cmake --preset=cuda -DACPP_TARGETS=generic
+cmake --build build/cuda --config Release --target stress_test_blocks
+./build/cuda/examples/stress_test_blocks/Release/stress_test_blocks
 
 # CI-equivalent runs
 cmake --workflow --preset=ci-linux-cuda

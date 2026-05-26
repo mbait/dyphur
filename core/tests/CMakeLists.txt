@@ -41,3 +41,12 @@ target_link_libraries(test_core_broadphase PRIVATE
 )
 add_sycl_to_target(TARGET test_core_broadphase SOURCES broadphase_test.cpp)
 dyphur_add_smoke_test(test_core_broadphase)
+
+# Narrowphase test: sphere-sphere, sphere-box, box-box contact detection, requires SYCL.
+add_executable(test_core_narrowphase narrowphase_test.cpp)
+target_link_libraries(test_core_narrowphase PRIVATE
+    dyphur::core
+    Catch2::Catch2WithMain
+)
+add_sycl_to_target(TARGET test_core_narrowphase SOURCES narrowphase_test.cpp)
+dyphur_add_smoke_test(test_core_narrowphase)

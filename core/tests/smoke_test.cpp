@@ -1,8 +1,9 @@
 #include "core/math/math.hpp"
+#include "core/body.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
-
+#include <type_traits>
 #include <cmath>
 
 using namespace dyphur;
@@ -113,4 +114,31 @@ TEST_CASE("SpatialVector: arithmetic", "[smoke]") {
     auto c = a + b;
     REQUIRE(c.angular.x == 2.f);
     REQUIRE(c.linear.z  == 8.f);
+}
+
+// ── Body ─────────────────────────────────────────────────────────────────────
+
+TEST_CASE("BodyFlag: bitmask values are distinct and non-zero", "[smoke]") {
+    REQUIRE(BodyFlag::Static    != 0u);
+    REQUIRE(BodyFlag::Kinematic != 0u);
+    REQUIRE(BodyFlag::Sleeping  != 0u);
+    REQUIRE((BodyFlag::Static & BodyFlag::Kinematic) == 0u);
+    REQUIRE((BodyFlag::Static & BodyFlag::Sleeping)  == 0u);
+    REQUIRE((BodyFlag::Kinematic & BodyFlag::Sleeping) == 0u);
+}
+
+TEST_CASE("BodyParams: default construction", "[smoke]") {
+    BodyParams p;
+    REQUIRE(p.position        == Vec3f::zero());
+    REQUIRE(p.rotation.w      == 1.f);
+    REQUIRE(p.rotation.xyz    == Vec3f::zero());
+    REQUIRE(p.linear_velocity == Vec3f::zero());
+    REQUIRE(p.mass            == 1.f);
+    REQUIRE(p.shape_handle    == 0u);
+    REQUIRE(p.flags           == 0u);
+}
+
+TEST_CASE("BodyView: is trivially copyable", "[smoke]") {
+    static_assert(std::is_trivially_copyable_v<BodyView>,
+        "BodyView must be trivially copyable for safe kernel capture");
 }

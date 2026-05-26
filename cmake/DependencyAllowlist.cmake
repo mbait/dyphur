@@ -41,6 +41,8 @@ set(DYPHUR_DEVICE_SAFE_HEADERS
     "compute/compute.hpp"
     # Convenience umbrella for all math types.
     "core/math/math.hpp"
+    # Body kernel-facing view (raw pointers + flags; no allocating headers).
+    "core/body.hpp"
 )
 
 add_custom_target(dyphur-lint-device-headers

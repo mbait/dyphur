@@ -16,7 +16,8 @@
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET": "x64-linux",
         "CMAKE_CROSS_CONFIGS": "all",
-        "CMAKE_DEFAULT_BUILD_TYPE": "Debug"
+        "CMAKE_DEFAULT_BUILD_TYPE": "Debug",
+        "AdaptiveCpp_DIR": "$env{HOME}/AdaptiveCpp/install/lib/cmake/AdaptiveCpp"
       },
       "environment": {
         "CMAKE_GENERATOR": "Ninja Multi-Config",

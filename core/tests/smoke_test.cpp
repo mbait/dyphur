@@ -1,5 +1,6 @@
 #include "core/math/math.hpp"
 #include "core/body.hpp"
+#include "core/articulation.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
@@ -141,4 +142,30 @@ TEST_CASE("BodyParams: default construction", "[smoke]") {
 TEST_CASE("BodyView: is trivially copyable", "[smoke]") {
     static_assert(std::is_trivially_copyable_v<BodyView>,
         "BodyView must be trivially copyable for safe kernel capture");
+}
+
+// ── Articulation ──────────────────────────────────────────────────────────────
+
+TEST_CASE("JointType: enum values are distinct", "[smoke]") {
+    REQUIRE(static_cast<uint8_t>(JointType::Fixed)    == 0);
+    REQUIRE(static_cast<uint8_t>(JointType::Revolute) == 1);
+    REQUIRE(static_cast<uint8_t>(JointType::Prismatic)== 2);
+    REQUIRE(static_cast<uint8_t>(JointType::Ball)     == 3);
+}
+
+TEST_CASE("JointParams: default construction", "[smoke]") {
+    JointParams p;
+    REQUIRE(p.body_parent  == 0u);
+    REQUIRE(p.body_child   == 0u);
+    REQUIRE(p.anchor_parent == Vec3f::zero());
+    REQUIRE(p.anchor_child  == Vec3f::zero());
+    REQUIRE(p.limit_lo >  p.limit_hi);  // limits disabled by default
+    REQUIRE(p.stiffness == 0.f);
+    REQUIRE(p.damping   == 0.f);
+    REQUIRE(p.type      == JointType::Fixed);
+}
+
+TEST_CASE("JointView: is trivially copyable", "[smoke]") {
+    static_assert(std::is_trivially_copyable_v<JointView>,
+        "JointView must be trivially copyable for safe kernel capture");
 }

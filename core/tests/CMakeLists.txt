@@ -59,3 +59,23 @@ target_link_libraries(test_core_xpbd PRIVATE
 )
 add_sycl_to_target(TARGET test_core_xpbd SOURCES xpbd_solver_test.cpp)
 dyphur_add_smoke_test(test_core_xpbd)
+
+# Physics-level determinism test: small scene, 20 frames, hash vs golden.
+add_executable(test_core_sim_determinism sim_determinism_test.cpp)
+target_link_libraries(test_core_sim_determinism PRIVATE
+    dyphur::core
+    Catch2::Catch2WithMain
+)
+add_sycl_to_target(TARGET test_core_sim_determinism SOURCES sim_determinism_test.cpp)
+dyphur_add_determinism_test(test_core_sim_determinism)
+
+# Per-stage microbenchmarks: integrator / broadphase / narrowphase / solver.
+# Run with: test_core_bench --benchmark-samples 20 --reporter json > bench.json
+add_executable(test_core_bench physics_benchmark.cpp)
+target_link_libraries(test_core_bench PRIVATE
+    dyphur::core
+    Catch2::Catch2WithMain
+)
+add_sycl_to_target(TARGET test_core_bench SOURCES physics_benchmark.cpp)
+# Benchmarks are not part of the smoke or determinism suites; run explicitly.
+add_test(NAME test_core_bench COMMAND test_core_bench --benchmark-samples 5)

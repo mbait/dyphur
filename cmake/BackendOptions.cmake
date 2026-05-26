@@ -36,3 +36,27 @@ message(STATUS "dyphur: backend = ${DYPHUR_BACKEND}")
 if(DYPHUR_SANITIZER)
     message(STATUS "dyphur: sanitizer = ${DYPHUR_SANITIZER}")
 endif()
+
+# Map DYPHUR_BACKEND to ACPP_TARGETS (AdaptiveCpp compilation target string).
+# ACPP_TARGETS can be overridden on the command line, e.g.:
+#   -DACPP_TARGETS="cuda:sm_90"   for H100
+#   -DACPP_TARGETS="hip:gfx1100"  for RX 7900
+if(NOT DEFINED ACPP_TARGETS)
+    if(DYPHUR_BACKEND STREQUAL "CUDA")
+        # Default: RTX 3060 (Ampere sm_86). Override for other GPUs.
+        set(ACPP_TARGETS "cuda:sm_86"
+            CACHE STRING "AdaptiveCpp compilation targets")
+    elseif(DYPHUR_BACKEND STREQUAL "HIP")
+        set(ACPP_TARGETS "hip"
+            CACHE STRING "AdaptiveCpp compilation targets")
+    elseif(DYPHUR_BACKEND STREQUAL "L0")
+        set(ACPP_TARGETS "level_zero:gpu"
+            CACHE STRING "AdaptiveCpp compilation targets")
+    else()
+        set(ACPP_TARGETS "omp"
+            CACHE STRING "AdaptiveCpp compilation targets")
+    endif()
+endif()
+
+find_package(AdaptiveCpp REQUIRED)
+message(STATUS "dyphur: ACPP_TARGETS = ${ACPP_TARGETS}")

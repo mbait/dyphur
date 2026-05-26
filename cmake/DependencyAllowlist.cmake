@@ -32,9 +32,15 @@ set(DYPHUR_DEVICE_SAFE_HEADERS
     "core/math/inertia.hpp"
     # Compute primitives that wrap SYCL types without leaking them.
     "compute/device.hpp"
+    "compute/stream.hpp"
     "compute/buffer.hpp"
     "compute/kernel.hpp"
+    "compute/reduction.hpp"
+    "compute/sort.hpp"
     "compute/atomics.hpp"
+    "compute/compute.hpp"
+    # Convenience umbrella for all math types.
+    "core/math/math.hpp"
 )
 
 add_custom_target(dyphur-lint-device-headers

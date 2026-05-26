@@ -88,7 +88,7 @@ These were debated extensively in the planning phase and are settled:
 
 ## Current state
 
-- **Phase 0 (Foundations)**: skeleton only. Build system stubs, empty include dirs, smoke tests that pass trivially. No real implementation yet.
+- **Phase 0 (Foundations)**: in progress. Compute shim headers and device math types are written. Tests written. Pending: AdaptiveCpp system install → configure → compile → all tests pass on CUDA/HIP/CPU.
 - v0.1 target = end of Phase 1 (rigid-body stress test, 1k+ bodies realtime, headless executable emitting trajectory dump + metrics JSON + determinism hash).
 
 ## What to do when stuck

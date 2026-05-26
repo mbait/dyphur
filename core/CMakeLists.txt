@@ -8,10 +8,9 @@ target_include_directories(dyphur_core INTERFACE
 target_link_libraries(dyphur_core INTERFACE
     dyphur::compute
     Eigen3::Eigen
+    spdlog::spdlog
+    fmt::fmt
 )
-
-# Physics core implementation files land here in Phases 1-2:
-#   target_sources(dyphur_core PRIVATE src/body.cpp src/integrator.cpp ...)
 
 if(BUILD_TESTING)
     add_subdirectory(tests)

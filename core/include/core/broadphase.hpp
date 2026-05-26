@@ -44,6 +44,11 @@ public:
     const uint32_t*    count_ptr() const noexcept { return d_count_.data(); }
     uint32_t           max_pairs() const noexcept { return max_pairs_; }
 
+    // Sort the pair buffer in-place by canonical (a, b) key.
+    // Must be called after build_and_query + s.wait() with the actual pair count.
+    // Ensures deterministic contact ordering when used with a sequential narrowphase.
+    void sort_pairs(Stream& s, uint32_t n_pairs);
+
     // Blocking download of the pair count.
     uint32_t download_count(Stream& s) const;
 
@@ -68,7 +73,8 @@ private:
     Buffer<int32_t>  d_root_;      // 1 element: index of the root internal node
 
     Buffer<ContactPair> d_pairs_;
-    Buffer<uint32_t>    d_count_;  // 1 element: emitted pair count
+    Buffer<uint32_t>    d_count_;   // 1 element: emitted pair count
+    Buffer<uint64_t>    d_pair_keys_; // scratch for deterministic pair sort
 };
 
 } // namespace dyphur

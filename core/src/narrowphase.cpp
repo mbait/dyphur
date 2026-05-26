@@ -231,9 +231,21 @@ static int box_box(
     int n_out = 0;
 
     if (best_type == 0 || best_type == 1) {
-        // Face contact: iterate over 8 vertices of the incident box.
-        // Reference box = A when best_type==0, B when best_type==1.
-        // Incident   box = B when best_type==0, A when best_type==1.
+        // Face contact: prefer the larger face as reference so that the smaller
+        // (incident) box's vertices lie within the reference face bounds.
+        // When best_type==0 (A face selected), check if B's parallel face is
+        // larger; if so, swap to use B as reference and iterate A's vertices.
+        if (best_type == 0) {
+            int t0A = (best_i+1)%3, t1A = (best_i+2)%3;
+            // Find B's axis most aligned with A's ref axis
+            int j_best = 0;
+            for (int j = 1; j < 3; ++j)
+                if (sycl::fabs(C[best_i][j]) > sycl::fabs(C[best_i][j_best])) j_best = j;
+            int t0B = (j_best+1)%3, t1B = (j_best+2)%3;
+            if (Bh[t0B]*Bh[t1B] > Ah[t0A]*Ah[t1A])
+                best_type = 1, best_i = j_best; // B has larger face → B is reference
+        }
+
         bool a_is_ref = (best_type == 0);
         int  ref_ax   = best_i;
 
@@ -366,8 +378,12 @@ void Narrowphase::run(Stream& s,
     ContactView cv = store_.view();
     const BodyView  bv = bodies;
     const ShapeView sv = shapes;
+    const uint32_t  np = n_pairs;
 
-    parallel_for(s, static_cast<size_t>(n_pairs), [=](size_t idx) {
+    // Sequential single work-item: pairs processed in fixed order → deterministic
+    // contact sequence when pairs are pre-sorted by (a,b).
+    parallel_for(s, 1, [=](size_t) {
+      for (uint32_t idx = 0; idx < np; ++idx) {
         ContactPair pair = d_pairs[idx];
         uint32_t ia = pair.a, ib = pair.b;
 
@@ -392,41 +408,32 @@ void Narrowphase::run(Stream& s,
         if (ta == kSphere && tb == kSphere) {
             if (!sphere_sphere(bv.pos_x[ia], bv.pos_y[ia], bv.pos_z[ia], sv.half_x[sha],
                                bv.pos_x[ib], bv.pos_y[ib], bv.pos_z[ib], sv.half_x[shb],
-                               px, py, pz, nx, ny, nz, depth)) return;
+                               px, py, pz, nx, ny, nz, depth)) continue;
             emit(cv, ia, ib, px, py, pz, nx, ny, nz, depth);
 
         } else if (ta == kSphere && tb == kBox) {
             float Be[3][3]; float Bh[3] = {sv.half_x[shb], sv.half_y[shb], sv.half_z[shb]};
             make_axes(ib, Be);
-            // sphere_box: box=ib (body B), sphere=ia (body A); normal from sphere toward box
             if (!sphere_box(bv.pos_x[ia], bv.pos_y[ia], bv.pos_z[ia], sv.half_x[sha],
                             bv.pos_x[ib], bv.pos_y[ib], bv.pos_z[ib],
                             Be[0][0], Be[0][1], Be[0][2],
                             Be[1][0], Be[1][1], Be[1][2],
                             Be[2][0], Be[2][1], Be[2][2],
                             Bh[0], Bh[1], Bh[2],
-                            px, py, pz, nx, ny, nz, depth)) return;
-            // sphere_box returns normal from sphere→box; we need from B(box)→A(sphere) = negate
-            // Wait: convention is normal from B toward A. ia=sphere=A, ib=box=B.
-            // sphere_box: normal from sphere (A) toward box (B) → we need to negate.
-            // Actually let me re-check sphere_box:
-            // sphere_box sets nx,ny,nz = direction from sphere toward box face (into box).
-            // We want from B(box) toward A(sphere) = -(sphere→box) = negate.
+                            px, py, pz, nx, ny, nz, depth)) continue;
             nx = -nx; ny = -ny; nz = -nz;
             emit(cv, ia, ib, px, py, pz, nx, ny, nz, depth);
 
         } else if (ta == kBox && tb == kSphere) {
             float Ae[3][3]; float Ah[3] = {sv.half_x[sha], sv.half_y[sha], sv.half_z[sha]};
             make_axes(ia, Ae);
-            // box=ia(A), sphere=ib(B); normal from B(sphere) toward A(box)
             if (!sphere_box(bv.pos_x[ib], bv.pos_y[ib], bv.pos_z[ib], sv.half_x[shb],
                             bv.pos_x[ia], bv.pos_y[ia], bv.pos_z[ia],
                             Ae[0][0], Ae[0][1], Ae[0][2],
                             Ae[1][0], Ae[1][1], Ae[1][2],
                             Ae[2][0], Ae[2][1], Ae[2][2],
                             Ah[0], Ah[1], Ah[2],
-                            px, py, pz, nx, ny, nz, depth)) return;
-            // sphere_box: normal from sphere(B) toward box(A) - that's from B toward A. ✓
+                            px, py, pz, nx, ny, nz, depth)) continue;
             emit(cv, ia, ib, px, py, pz, nx, ny, nz, depth);
 
         } else if (ta == kBox && tb == kBox) {
@@ -443,7 +450,9 @@ void Narrowphase::run(Stream& s,
             for (int k = 0; k < nc; ++k)
                 emit(cv, ia, ib, opx[k], opy[k], opz[k], onx, ony, onz, od[k]);
         }
-    });
+      } // for idx
+    }); // parallel_for
 }
+
 
 } // namespace dyphur

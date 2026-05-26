@@ -100,6 +100,7 @@ Broadphase::Broadphase(Stream& s, uint32_t max_bodies, uint32_t max_pairs)
     , d_root_(s, 1)
     , d_pairs_(s, max_pairs)
     , d_count_(s, 1)
+    , d_pair_keys_(s, max_pairs)
 {}
 
 // ── Build + Query ─────────────────────────────────────────────────────────────
@@ -344,6 +345,19 @@ void Broadphase::build_and_query(Stream&         s,
             }
         });
     }
+}
+
+void Broadphase::sort_pairs(Stream& s, uint32_t n_pairs) {
+    if (n_pairs <= 1) return;
+    uint32_t n_sort = next_pow2(n_pairs);
+    // Init sort region to UINT64_MAX so padding goes to the end.
+    s.queue().memset(d_pair_keys_.data(), 0xFF, n_sort * sizeof(uint64_t));
+    const ContactPair* pairs = d_pairs_.data();
+    uint64_t* keys = d_pair_keys_.data();
+    parallel_for(s, n_pairs, [pairs, keys](size_t i) {
+        keys[i] = ((uint64_t)pairs[i].a << 32) | (uint64_t)pairs[i].b;
+    });
+    sort_by_key(s, keys, d_pairs_.data(), static_cast<size_t>(n_sort));
 }
 
 uint32_t Broadphase::download_count(Stream& s) const {

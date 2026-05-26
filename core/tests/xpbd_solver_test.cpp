@@ -56,7 +56,7 @@ TEST_CASE("XpbdSolver: sphere-sphere separates", "[solver][smoke]") {
 
     REQUIRE(np.download_count(s) == 1u);
 
-    XpbdSolver solver(1);
+    XpbdSolver solver(s, 1);
     solver.solve(s, np.contacts(), bs.view(), 1.f/60.f);
     s.wait();
 
@@ -94,7 +94,7 @@ TEST_CASE("XpbdSolver: approaching velocity damped", "[solver][smoke]") {
 
     REQUIRE(np.download_count(s) == 1u);
 
-    XpbdSolver solver(1);
+    XpbdSolver solver(s, 1);
     solver.solve(s, np.contacts(), bs.view(), 1.f/60.f);
     s.wait();
 
@@ -135,7 +135,7 @@ TEST_CASE("XpbdSolver: static body unmoved", "[solver][smoke]") {
 
     REQUIRE(np.download_count(s) == 1u);
 
-    XpbdSolver solver(1);
+    XpbdSolver solver(s, 1);
     solver.solve(s, np.contacts(), bs.view(), 1.f/60.f);
     s.wait();
 

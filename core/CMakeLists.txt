@@ -5,6 +5,7 @@ add_library(dyphur_core STATIC
     src/broadphase.cpp
     src/contact_store.cpp
     src/narrowphase.cpp
+    src/xpbd_solver.cpp
 )
 add_library(dyphur::core ALIAS dyphur_core)
 add_sycl_to_target(TARGET dyphur_core SOURCES
@@ -14,6 +15,7 @@ add_sycl_to_target(TARGET dyphur_core SOURCES
     src/broadphase.cpp
     src/contact_store.cpp
     src/narrowphase.cpp
+    src/xpbd_solver.cpp
 )
 
 target_include_directories(dyphur_core PUBLIC

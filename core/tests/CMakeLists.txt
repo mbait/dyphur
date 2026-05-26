@@ -50,3 +50,12 @@ target_link_libraries(test_core_narrowphase PRIVATE
 )
 add_sycl_to_target(TARGET test_core_narrowphase SOURCES narrowphase_test.cpp)
 dyphur_add_smoke_test(test_core_narrowphase)
+
+# XPBD solver test: position + velocity correction correctness, requires SYCL.
+add_executable(test_core_xpbd xpbd_solver_test.cpp)
+target_link_libraries(test_core_xpbd PRIVATE
+    dyphur::core
+    Catch2::Catch2WithMain
+)
+add_sycl_to_target(TARGET test_core_xpbd SOURCES xpbd_solver_test.cpp)
+dyphur_add_smoke_test(test_core_xpbd)

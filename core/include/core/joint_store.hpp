@@ -27,6 +27,7 @@ public:
 
     uint32_t  add(const JointParams& p);
     void      upload();
+    void      set_targets(const float* pos, const float* vel);  // update PD targets and re-upload
     JointView view() noexcept;
 
     uint32_t count()    const noexcept { return count_; }

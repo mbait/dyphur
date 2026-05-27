@@ -6,25 +6,35 @@ namespace dyphur {
 
 // Sequential Gauss-Seidel XPBD solver.
 //
-// Processes contacts in a fixed order (deterministic) from a single GPU
-// work-item. Runs n_iters position+velocity correction passes per call.
-// Angular response is included (full rigid body, diagonal body-frame inertia).
-// Restitution is zero (inelastic); friction is deferred to Phase 2.
+// Each solve call processes contacts and joints together in n_iters passes.
+// Angular response is full rigid body (body-frame diagonal inertia).
+// Restitution: zero (inelastic). Friction: Coulomb, global coefficient mu.
 //
-// lambda_c_ accumulates per-contact resolved depth across iterations so that
-// each contact is corrected at most once per solve call (prevents the 10×
-// over-application that would otherwise occur with multi-iteration GS and
-// vertex-face manifolds producing multiple contacts per body pair).
+// Joint types handled:
+//   Fixed    — positional (3 DOF) + quaternion angular (3 DOF)
+//   Ball     — positional (3 DOF) only
+//   Revolute — positional (3 DOF) + axis-alignment angular (2 DOF) + optional PD motor + limits
+//   Prismatic— quaternion angular (3 DOF) + transverse positional (2 DOF) + optional PD motor + limits
+//
+// lambda_c_ accumulates per-contact resolved depth so that each contact is
+// corrected at most once per solve call (prevents over-application in manifolds
+// with multiple contact points per body pair).
 class XpbdSolver final : public IConstraintSolver {
 public:
-    explicit XpbdSolver(Stream& s, int n_iters = 10,
-                        uint32_t max_contacts = 16384);
+    explicit XpbdSolver(Stream& s,
+                        int      n_iters      = 10,
+                        uint32_t max_contacts = 16384,
+                        float    friction     = 0.5f);
 
-    void solve(Stream& s, const ContactView& contacts,
-               BodyView bodies, float dt) override;
+    void solve(Stream& s,
+               const ContactView& contacts,
+               const JointView&   joints,
+               BodyView           bodies,
+               float              dt) override;
 
 private:
     int           n_iters_;
+    float         friction_;
     Buffer<float> lambda_c_;
 };
 

@@ -13,6 +13,7 @@
 #include <core/narrowphase.hpp>
 #include <core/shape_store.hpp>
 #include <core/xpbd_solver.hpp>
+#include <core/articulation.hpp>
 #include <compute/device.hpp>
 #include <spdlog/spdlog.h>
 #include <fmt/format.h>
@@ -188,7 +189,7 @@ int main(int argc, char** argv) {
         uint32_t n_contacts = np.download_count(s);
         total_contacts += n_contacts;
 
-        solver.solve(s, np.contacts(), bv, DT);
+        solver.solve(s, np.contacts(), JointView{}, bv, DT);
         s.wait();
 
         // Snapshot trajectory at 30 Hz (every other frame)

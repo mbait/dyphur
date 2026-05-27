@@ -59,6 +59,13 @@ uint32_t JointStore::add(const JointParams& p) {
     return count_++;
 }
 
+void JointStore::set_targets(const float* pos, const float* vel) {
+    std::copy(pos, pos + count_, h_target_pos_.begin());
+    std::copy(vel, vel + count_, h_target_vel_.begin());
+    d_target_pos_.upload(h_target_pos_.data(), count_);
+    d_target_vel_.upload(h_target_vel_.data(), count_);
+}
+
 void JointStore::upload() {
     if (count_ == 0) return;
     const uint32_t n = count_;

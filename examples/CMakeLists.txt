@@ -1,1 +1,2 @@
 add_subdirectory(stress_test_blocks)
+add_subdirectory(manipulator_pick)

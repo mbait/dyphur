@@ -4,6 +4,7 @@
 #include <core/narrowphase.hpp>
 #include <core/shape_store.hpp>
 #include <core/xpbd_solver.hpp>
+#include <core/articulation.hpp>
 #include <compute/buffer.hpp>
 #include <compute/device.hpp>
 #include <vector>
@@ -57,7 +58,7 @@ TEST_CASE("XpbdSolver: sphere-sphere separates", "[solver][smoke]") {
     REQUIRE(np.download_count(s) == 1u);
 
     XpbdSolver solver(s, 1);
-    solver.solve(s, np.contacts(), bs.view(), 1.f/60.f);
+    solver.solve(s, np.contacts(), JointView{}, bs.view(), 1.f/60.f);
     s.wait();
 
     auto& q = s.queue();
@@ -95,7 +96,7 @@ TEST_CASE("XpbdSolver: approaching velocity damped", "[solver][smoke]") {
     REQUIRE(np.download_count(s) == 1u);
 
     XpbdSolver solver(s, 1);
-    solver.solve(s, np.contacts(), bs.view(), 1.f/60.f);
+    solver.solve(s, np.contacts(), JointView{}, bs.view(), 1.f/60.f);
     s.wait();
 
     auto& q = s.queue();
@@ -136,7 +137,7 @@ TEST_CASE("XpbdSolver: static body unmoved", "[solver][smoke]") {
     REQUIRE(np.download_count(s) == 1u);
 
     XpbdSolver solver(s, 1);
-    solver.solve(s, np.contacts(), bs.view(), 1.f/60.f);
+    solver.solve(s, np.contacts(), JointView{}, bs.view(), 1.f/60.f);
     s.wait();
 
     auto& q = s.queue();

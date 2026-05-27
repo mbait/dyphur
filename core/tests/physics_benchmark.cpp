@@ -6,6 +6,7 @@
 #include <core/narrowphase.hpp>
 #include <core/shape_store.hpp>
 #include <core/xpbd_solver.hpp>
+#include <core/articulation.hpp>
 #include <compute/device.hpp>
 
 using namespace dyphur;
@@ -81,7 +82,7 @@ struct BenchScene {
             uint32_t np_ = bp.download_count(s);
             bp.sort_pairs(s, np_); s.wait();
             np.run(s, bp.pairs_ptr(), np_, bv, sv); s.wait();
-            solver.solve(s, np.contacts(), bv, DT); s.wait();
+            solver.solve(s, np.contacts(), JointView{}, bv, DT); s.wait();
         }
     }
 };
@@ -129,7 +130,7 @@ TEST_CASE("physics benchmarks: 512 bodies", "[benchmark]") {
     sc.s.wait();
 
     BENCHMARK("xpbd solver") {
-        sc.solver.solve(sc.s, sc.np.contacts(), sc.bv, DT);
+        sc.solver.solve(sc.s, sc.np.contacts(), JointView{}, sc.bv, DT);
         sc.s.wait();
     };
 }

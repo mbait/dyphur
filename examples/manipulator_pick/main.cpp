@@ -289,16 +289,14 @@ int main(int argc, char** argv) {
         js.set_targets(targets, zeros);
 
         integrate(s, bv, ip);
-        s.wait();
-
         solver.solve(s, cs.view(), jv, bv, ip.dt);
-        s.wait();
 
         if (frame % 2 == 0) {
             download_state();
             write_traj_frame();
         }
     }
+    s.wait();  // single end-of-batch sync for timing
 
     traj.close();
 

@@ -144,13 +144,14 @@ int main(int argc, char** argv)
     auto t0 = std::chrono::steady_clock::now();
 
     for (int f = 0; f < n_frames; ++f) {
-        integrate(s, bv, ip); s.wait();
-        bp.build_and_query(s, bv, sv, bounds); s.wait();
-        uint32_t np_ = bp.download_count(s);
-        bp.sort_pairs(s, np_); s.wait();
-        np.run(s, bp.pairs_ptr(), np_, bv, sv, hv, mv); s.wait();
-        solver.solve(s, np.contacts(), jv, bv, ip.dt); s.wait();
+        integrate(s, bv, ip);
+        bp.build_and_query(s, bv, sv, bounds);
+        uint32_t np_ = bp.download_count(s);  // one sync per frame
+        bp.sort_pairs(s, np_);                 // no-op when np_ <= 1
+        np.run(s, bp.pairs_ptr(), np_, bv, sv, hv, mv);  // always resets contact store
+        solver.solve(s, np.contacts(), jv, bv, ip.dt);
     }
+    s.wait();  // single end-of-batch sync for timing
 
     auto t1 = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(t1 - t0).count();

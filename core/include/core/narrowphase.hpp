@@ -34,6 +34,15 @@ public:
              ConvexHullView hulls = {},
              MeshBvhCatalogView meshes = {});
 
+    // Async-capable variant: reads pair count from device memory (no CPU sync needed).
+    // Submits all work to s without blocking; safe to chain sort→run→solve with a
+    // single s.wait() or download_count at the frame boundary.
+    void run(Stream& s,
+             const ContactPair* d_pairs, const uint32_t* d_n_pairs,
+             const BodyView& bodies, const ShapeView& shapes,
+             ConvexHullView hulls = {},
+             MeshBvhCatalogView meshes = {});
+
     ContactView contacts()   noexcept { return store_.view(); }
     uint32_t download_count(Stream& s) const { return store_.download_count(s); }
 

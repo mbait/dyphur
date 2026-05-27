@@ -80,13 +80,14 @@ static uint64_t run_sim(Device& dev) {
     const AABB bounds = {-10, -2, -10, 10, 15, 10};
 
     for (int f = 0; f < N_FRAMES; ++f) {
-        integrate(s, bv, ip); s.wait();
-        bp.build_and_query(s, bv, sv, bounds); s.wait();
-        uint32_t np_ = bp.download_count(s);
-        bp.sort_pairs(s, np_); s.wait();
-        np.run(s, bp.pairs_ptr(), np_, bv, sv); s.wait();
-        solver.solve(s, np.contacts(), JointView{}, bv, DT); s.wait();
+        integrate(s, bv, ip);
+        bp.build_and_query(s, bv, sv, bounds);
+        uint32_t np_ = bp.download_count(s);  // one sync per frame
+        bp.sort_pairs(s, np_);                 // no-op when np_ <= 1
+        np.run(s, bp.pairs_ptr(), np_, bv, sv);  // always resets contact store
+        solver.solve(s, np.contacts(), JointView{}, bv, DT);
     }
+    s.wait();
 
     std::vector<float> hx(N_BODIES), hy(N_BODIES), hz(N_BODIES);
     std::vector<float> hw(N_BODIES), hqx(N_BODIES), hqy(N_BODIES), hqz(N_BODIES);
@@ -170,9 +171,10 @@ static uint64_t run_artic_sim(Device& dev) {
     BodyView  bv = bs.view();
     JointView jv = js.view();
     for (int f = 0; f < N_FRAMES; ++f) {
-        integrate(s, bv, ip); s.wait();
-        solver.solve(s, cs.view(), jv, bv, DT); s.wait();
+        integrate(s, bv, ip);
+        solver.solve(s, cs.view(), jv, bv, DT);
     }
+    s.wait();
 
     std::vector<float> hx(N_AB), hy(N_AB), hz(N_AB);
     std::vector<float> hw(N_AB), hqx(N_AB), hqy(N_AB), hqz(N_AB);

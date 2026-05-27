@@ -176,27 +176,19 @@ int main(int argc, char** argv) {
 
     for (int frame = 0; frame < n_frames; ++frame) {
         integrate(s, bv, ip);
-        s.wait();
-
         bp.build_and_query(s, bv, sv, scene_bounds);
-        s.wait();
-        uint32_t n_pairs = bp.download_count(s);
-        bp.sort_pairs(s, n_pairs);
-        s.wait();
-
-        np.run(s, bp.pairs_ptr(), n_pairs, bv, sv);
-        s.wait();
-        uint32_t n_contacts = np.download_count(s);
-        total_contacts += n_contacts;
-
+        uint32_t n_pairs = bp.download_count(s);  // one sync per frame
+        bp.sort_pairs(s, n_pairs);                 // no-op when n_pairs <= 1
+        np.run(s, bp.pairs_ptr(), n_pairs, bv, sv);  // always resets contact store
         solver.solve(s, np.contacts(), JointView{}, bv, DT);
-        s.wait();
 
-        // Snapshot trajectory at 30 Hz (every other frame)
+        // Trajectory snapshot every other frame (download_state provides GPU sync).
+        // Contact count is read after the solver either way.
         if (frame % 2 == 0) {
             download_state();
             write_traj_frame();
         }
+        total_contacts += np.download_count(s);
     }
 
     traj.close();

@@ -896,6 +896,136 @@ inline void make_axes(float qw,float qx,float qy,float qz, float Ae[3][3]) {
     Ae[2][0]=2.f*(qx*qz+qy*qw);     Ae[2][1]=2.f*(qy*qz-qx*qw); Ae[2][2]=1.f-2.f*(qx*qx+qy*qy);
 }
 
+// ── Per-pair dispatch (shared by both run() overloads) ────────────────────────
+static inline void process_pair(
+    uint32_t idx, const ContactPair* d_pairs,
+    const BodyView& bv, const ShapeView& sv,
+    ConvexHullView hv, MeshBvhCatalogView mv,
+    ContactView cv)
+{
+    ContactPair pair = d_pairs[idx];
+    uint32_t ia = pair.a, ib = pair.b;
+
+    uint32_t sha = bv.shape[ia], shb = bv.shape[ib];
+    uint32_t ta  = sv.type[sha], tb  = sv.type[shb];
+
+    constexpr uint32_t kBox    = static_cast<uint32_t>(ShapeType::Box);
+    constexpr uint32_t kSphere = static_cast<uint32_t>(ShapeType::Sphere);
+    constexpr uint32_t kHull   = static_cast<uint32_t>(ShapeType::ConvexHull);
+    constexpr uint32_t kMesh   = static_cast<uint32_t>(ShapeType::TriangleMesh);
+
+    // Swap so that TriangleMesh is always body B (static)
+    if (ta == kMesh) {
+        uint32_t tmp=ia; ia=ib; ib=tmp;
+        uint32_t tmps=sha; sha=shb; shb=tmps;
+        uint32_t tmpt=ta; ta=tb; tb=tmpt;
+    }
+
+    float px, py, pz, nx, ny, nz, depth;
+
+    if (ta == kSphere && tb == kSphere) {
+        if (!sphere_sphere(bv.pos_x[ia], bv.pos_y[ia], bv.pos_z[ia], sv.half_x[sha],
+                           bv.pos_x[ib], bv.pos_y[ib], bv.pos_z[ib], sv.half_x[shb],
+                           px, py, pz, nx, ny, nz, depth)) return;
+        emit(cv, ia, ib, px, py, pz, nx, ny, nz, depth);
+        return;
+    }
+
+    if (ta == kSphere && tb == kBox) {
+        float Be[3][3]; float Bh[3] = {sv.half_x[shb], sv.half_y[shb], sv.half_z[shb]};
+        make_axes(bv.rot_w[ib], bv.rot_x[ib], bv.rot_y[ib], bv.rot_z[ib], Be);
+        if (!sphere_box(bv.pos_x[ia], bv.pos_y[ia], bv.pos_z[ia], sv.half_x[sha],
+                        bv.pos_x[ib], bv.pos_y[ib], bv.pos_z[ib],
+                        Be[0][0], Be[0][1], Be[0][2],
+                        Be[1][0], Be[1][1], Be[1][2],
+                        Be[2][0], Be[2][1], Be[2][2],
+                        Bh[0], Bh[1], Bh[2], px, py, pz, nx, ny, nz, depth)) return;
+        nx = -nx; ny = -ny; nz = -nz;
+        emit(cv, ia, ib, px, py, pz, nx, ny, nz, depth);
+        return;
+    }
+
+    if (ta == kBox && tb == kSphere) {
+        float Ae[3][3]; float Ah[3] = {sv.half_x[sha], sv.half_y[sha], sv.half_z[sha]};
+        make_axes(bv.rot_w[ia], bv.rot_x[ia], bv.rot_y[ia], bv.rot_z[ia], Ae);
+        if (!sphere_box(bv.pos_x[ib], bv.pos_y[ib], bv.pos_z[ib], sv.half_x[shb],
+                        bv.pos_x[ia], bv.pos_y[ia], bv.pos_z[ia],
+                        Ae[0][0], Ae[0][1], Ae[0][2],
+                        Ae[1][0], Ae[1][1], Ae[1][2],
+                        Ae[2][0], Ae[2][1], Ae[2][2],
+                        Ah[0], Ah[1], Ah[2], px, py, pz, nx, ny, nz, depth)) return;
+        emit(cv, ia, ib, px, py, pz, nx, ny, nz, depth);
+        return;
+    }
+
+    if (ta == kBox && tb == kBox) {
+        float Ae[3][3]; float Ah[3] = {sv.half_x[sha], sv.half_y[sha], sv.half_z[sha]};
+        float Be_m[3][3]; float Bh[3] = {sv.half_x[shb], sv.half_y[shb], sv.half_z[shb]};
+        make_axes(bv.rot_w[ia], bv.rot_x[ia], bv.rot_y[ia], bv.rot_z[ia], Ae);
+        make_axes(bv.rot_w[ib], bv.rot_x[ib], bv.rot_y[ib], bv.rot_z[ib], Be_m);
+        float opx[4], opy[4], opz[4], od[4];
+        float onx, ony, onz;
+        int nc = box_box(bv.pos_x[ia], bv.pos_y[ia], bv.pos_z[ia], Ae, Ah,
+                         bv.pos_x[ib], bv.pos_y[ib], bv.pos_z[ib], Be_m, Bh,
+                         opx, opy, opz, onx, ony, onz, od);
+        // Reduce to centroid: sequential application of 4 angular corrections
+        // causes non-commutative quaternion drift that destabilizes the simulation.
+        if (nc > 0) {
+            float cx = 0, cy = 0, cz = 0, cd = 0;
+            for (int k = 0; k < nc; ++k) { cx+=opx[k]; cy+=opy[k]; cz+=opz[k]; cd+=od[k]; }
+            float inv = 1.f / nc;
+            emit(cv, ia, ib, cx*inv, cy*inv, cz*inv, onx, ony, onz, cd*inv);
+        }
+        return;
+    }
+
+    if (ta == kHull || tb == kHull) {
+        if (hv.n_hulls == 0) return;
+        if (ta == kHull && tb == kHull) {
+            uint32_t hull_a = sv.ext_id[sha], hull_b = sv.ext_id[shb];
+            float onx,ony,onz,odepth,opx,opy,opz;
+            if (gjk_epa(hv, hull_a,
+                         bv.pos_x[ia],bv.pos_y[ia],bv.pos_z[ia],
+                         bv.rot_w[ia],bv.rot_x[ia],bv.rot_y[ia],bv.rot_z[ia],
+                         hv, hull_b,
+                         bv.pos_x[ib],bv.pos_y[ib],bv.pos_z[ib],
+                         bv.rot_w[ib],bv.rot_x[ib],bv.rot_y[ib],bv.rot_z[ib],
+                         onx,ony,onz,odepth,opx,opy,opz))
+                emit(cv,ia,ib,opx,opy,opz,onx,ony,onz,odepth);
+        }
+        return;
+    }
+
+    if (tb == kMesh) {
+        if (mv.n_meshes == 0) return;
+        uint32_t mesh_id = sv.ext_id[shb];
+        if (mesh_id >= mv.n_meshes) return;
+
+        uint32_t vtx_off  = mv.vtx_offset[mesh_id];
+        uint32_t tri_off  = mv.tri_offset[mesh_id];
+        uint32_t root     = mv.root_node[mesh_id];
+        const float*    vx = mv.vtx_x + vtx_off;
+        const float*    vy = mv.vtx_y + vtx_off;
+        const float*    vz = mv.vtx_z + vtx_off;
+        const uint32_t* ta_ = mv.tri_a + tri_off;
+        const uint32_t* tb_ = mv.tri_b + tri_off;
+        const uint32_t* tc_ = mv.tri_c + tri_off;
+        const BvhNode*  nodes = mv.nodes;
+
+        if (ta == kSphere) {
+            traverse_sphere_mesh(cv, ia, ib,
+                bv.pos_x[ia],bv.pos_y[ia],bv.pos_z[ia], sv.half_x[sha],
+                vx,vy,vz, ta_,tb_,tc_, nodes, root);
+        } else if (ta == kBox) {
+            float Re[3][3]; float ah[3]={sv.half_x[sha],sv.half_y[sha],sv.half_z[sha]};
+            make_axes(bv.rot_w[ia],bv.rot_x[ia],bv.rot_y[ia],bv.rot_z[ia], Re);
+            traverse_box_mesh(cv,ia,ib,
+                bv.pos_x[ia],bv.pos_y[ia],bv.pos_z[ia], Re, ah[0],ah[1],ah[2],
+                vx,vy,vz, ta_,tb_,tc_, nodes, root);
+        }
+    }
+}
+
 } // anonymous namespace
 
 // ── Narrowphase constructor ───────────────────────────────────────────────────
@@ -904,7 +1034,7 @@ Narrowphase::Narrowphase(Stream& s, uint32_t max_contacts)
     : store_(s, max_contacts)
 {}
 
-// ── Narrowphase::run ──────────────────────────────────────────────────────────
+// ── Narrowphase::run (CPU pair count) ────────────────────────────────────────
 
 void Narrowphase::run(Stream& s,
                       const ContactPair* d_pairs, uint32_t n_pairs,
@@ -919,144 +1049,36 @@ void Narrowphase::run(Stream& s,
     const BodyView  bv = bodies;
     const ShapeView sv = shapes;
     const uint32_t  np = n_pairs;
-    const ConvexHullView    hv = hulls;
+    const ConvexHullView     hv = hulls;
     const MeshBvhCatalogView mv = meshes;
 
     parallel_for(s, 1, [=](size_t) {
-      for (uint32_t idx = 0; idx < np; ++idx) {
-        ContactPair pair = d_pairs[idx];
-        uint32_t ia = pair.a, ib = pair.b;
+        for (uint32_t idx = 0; idx < np; ++idx)
+            process_pair(idx, d_pairs, bv, sv, hv, mv, cv);
+    });
+}
 
-        uint32_t sha = bv.shape[ia], shb = bv.shape[ib];
-        uint32_t ta  = sv.type[sha], tb  = sv.type[shb];
+// ── Narrowphase::run (device pair count — no CPU sync needed) ─────────────────
 
-        constexpr uint32_t kBox    = static_cast<uint32_t>(ShapeType::Box);
-        constexpr uint32_t kSphere = static_cast<uint32_t>(ShapeType::Sphere);
-        constexpr uint32_t kHull   = static_cast<uint32_t>(ShapeType::ConvexHull);
-        constexpr uint32_t kMesh   = static_cast<uint32_t>(ShapeType::TriangleMesh);
+void Narrowphase::run(Stream& s,
+                      const ContactPair* d_pairs, const uint32_t* d_n_pairs,
+                      const BodyView& bodies, const ShapeView& shapes,
+                      ConvexHullView hulls,
+                      MeshBvhCatalogView meshes)
+{
+    store_.reset(s);
 
-        // Swap so that TriangleMesh is always body B (static)
-        if (ta == kMesh) {
-            uint32_t tmp=ia; ia=ib; ib=tmp;
-            uint32_t tmps=sha; sha=shb; shb=tmps;
-            uint32_t tmpt=ta; ta=tb; tb=tmpt;
-        }
+    ContactView cv = store_.view();
+    const BodyView  bv = bodies;
+    const ShapeView sv = shapes;
+    const ConvexHullView     hv = hulls;
+    const MeshBvhCatalogView mv = meshes;
 
-        float px, py, pz, nx, ny, nz, depth;
-
-        // ── Primitive vs. Primitive ─────────────────────────────────────────
-        if (ta == kSphere && tb == kSphere) {
-            if (!sphere_sphere(bv.pos_x[ia], bv.pos_y[ia], bv.pos_z[ia], sv.half_x[sha],
-                               bv.pos_x[ib], bv.pos_y[ib], bv.pos_z[ib], sv.half_x[shb],
-                               px, py, pz, nx, ny, nz, depth)) continue;
-            emit(cv, ia, ib, px, py, pz, nx, ny, nz, depth);
-            continue;
-        }
-
-        if (ta == kSphere && tb == kBox) {
-            float Be[3][3]; float Bh[3] = {sv.half_x[shb], sv.half_y[shb], sv.half_z[shb]};
-            make_axes(bv.rot_w[ib], bv.rot_x[ib], bv.rot_y[ib], bv.rot_z[ib], Be);
-            if (!sphere_box(bv.pos_x[ia], bv.pos_y[ia], bv.pos_z[ia], sv.half_x[sha],
-                            bv.pos_x[ib], bv.pos_y[ib], bv.pos_z[ib],
-                            Be[0][0], Be[0][1], Be[0][2],
-                            Be[1][0], Be[1][1], Be[1][2],
-                            Be[2][0], Be[2][1], Be[2][2],
-                            Bh[0], Bh[1], Bh[2], px, py, pz, nx, ny, nz, depth)) continue;
-            nx = -nx; ny = -ny; nz = -nz;
-            emit(cv, ia, ib, px, py, pz, nx, ny, nz, depth);
-            continue;
-        }
-
-        if (ta == kBox && tb == kSphere) {
-            float Ae[3][3]; float Ah[3] = {sv.half_x[sha], sv.half_y[sha], sv.half_z[sha]};
-            make_axes(bv.rot_w[ia], bv.rot_x[ia], bv.rot_y[ia], bv.rot_z[ia], Ae);
-            if (!sphere_box(bv.pos_x[ib], bv.pos_y[ib], bv.pos_z[ib], sv.half_x[shb],
-                            bv.pos_x[ia], bv.pos_y[ia], bv.pos_z[ia],
-                            Ae[0][0], Ae[0][1], Ae[0][2],
-                            Ae[1][0], Ae[1][1], Ae[1][2],
-                            Ae[2][0], Ae[2][1], Ae[2][2],
-                            Ah[0], Ah[1], Ah[2], px, py, pz, nx, ny, nz, depth)) continue;
-            emit(cv, ia, ib, px, py, pz, nx, ny, nz, depth);
-            continue;
-        }
-
-        if (ta == kBox && tb == kBox) {
-            float Ae[3][3]; float Ah[3] = {sv.half_x[sha], sv.half_y[sha], sv.half_z[sha]};
-            float Be_m[3][3]; float Bh[3] = {sv.half_x[shb], sv.half_y[shb], sv.half_z[shb]};
-            make_axes(bv.rot_w[ia], bv.rot_x[ia], bv.rot_y[ia], bv.rot_z[ia], Ae);
-            make_axes(bv.rot_w[ib], bv.rot_x[ib], bv.rot_y[ib], bv.rot_z[ib], Be_m);
-            float opx[4], opy[4], opz[4], od[4];
-            float onx, ony, onz;
-            int nc = box_box(bv.pos_x[ia], bv.pos_y[ia], bv.pos_z[ia], Ae, Ah,
-                             bv.pos_x[ib], bv.pos_y[ib], bv.pos_z[ib], Be_m, Bh,
-                             opx, opy, opz, onx, ony, onz, od);
-            // Reduce multi-point manifold to one centroid contact: sequential
-            // application of 4 angular corrections causes non-commutative quaternion
-            // drift that accumulates and destabilizes the simulation.
-            if (nc > 0) {
-                float cx = 0, cy = 0, cz = 0, cd = 0;
-                for (int k = 0; k < nc; ++k) { cx+=opx[k]; cy+=opy[k]; cz+=opz[k]; cd+=od[k]; }
-                float inv = 1.f / nc;
-                emit(cv, ia, ib, cx*inv, cy*inv, cz*inv, onx, ony, onz, cd*inv);
-            }
-            continue;
-        }
-
-        // ── ConvexHull vs. * ────────────────────────────────────────────────
-        if (ta == kHull || tb == kHull) {
-            if (hv.n_hulls == 0) continue; // catalog not provided
-
-            // Convert non-hull shape to a single-triangle or single-vert hull on the fly?
-            // For now: only hull-vs-hull. Hull-vs-primitive handled via GJK with box/sphere hull.
-            if (ta == kHull && tb == kHull) {
-                uint32_t hull_a = sv.ext_id[sha], hull_b = sv.ext_id[shb];
-                float onx,ony,onz,odepth,opx,opy,opz;
-                if (gjk_epa(hv, hull_a,
-                             bv.pos_x[ia],bv.pos_y[ia],bv.pos_z[ia],
-                             bv.rot_w[ia],bv.rot_x[ia],bv.rot_y[ia],bv.rot_z[ia],
-                             hv, hull_b,
-                             bv.pos_x[ib],bv.pos_y[ib],bv.pos_z[ib],
-                             bv.rot_w[ib],bv.rot_x[ib],bv.rot_y[ib],bv.rot_z[ib],
-                             onx,ony,onz,odepth,opx,opy,opz))
-                    emit(cv,ia,ib,opx,opy,opz,onx,ony,onz,odepth);
-            }
-            // Hull-vs-box and hull-vs-sphere could be added similarly.
-            continue;
-        }
-
-        // ── * vs. TriangleMesh (ib is the mesh body) ────────────────────────
-        if (tb == kMesh) {
-            if (mv.n_meshes == 0) continue;
-            uint32_t mesh_id = sv.ext_id[shb];
-            if (mesh_id >= mv.n_meshes) continue;
-
-            uint32_t vtx_off  = mv.vtx_offset[mesh_id];
-            uint32_t tri_off  = mv.tri_offset[mesh_id];
-            uint32_t root     = mv.root_node[mesh_id];
-            const float*    vx = mv.vtx_x + vtx_off;
-            const float*    vy = mv.vtx_y + vtx_off;
-            const float*    vz = mv.vtx_z + vtx_off;
-            const uint32_t* ta_ = mv.tri_a + tri_off;
-            const uint32_t* tb_ = mv.tri_b + tri_off;
-            const uint32_t* tc_ = mv.tri_c + tri_off;
-            const BvhNode*  nodes = mv.nodes;
-
-            if (ta == kSphere) {
-                traverse_sphere_mesh(cv, ia, ib,
-                    bv.pos_x[ia],bv.pos_y[ia],bv.pos_z[ia], sv.half_x[sha],
-                    vx,vy,vz, ta_,tb_,tc_, nodes, root);
-            } else if (ta == kBox) {
-                float Re[3][3]; float ah[3]={sv.half_x[sha],sv.half_y[sha],sv.half_z[sha]};
-                make_axes(bv.rot_w[ia],bv.rot_x[ia],bv.rot_y[ia],bv.rot_z[ia], Re);
-                traverse_box_mesh(cv,ia,ib,
-                    bv.pos_x[ia],bv.pos_y[ia],bv.pos_z[ia], Re, ah[0],ah[1],ah[2],
-                    vx,vy,vz, ta_,tb_,tc_, nodes, root);
-            }
-            continue;
-        }
-
-      } // for idx
-    }); // parallel_for
+    parallel_for(s, 1, [=](size_t) {
+        uint32_t np = *d_n_pairs;
+        for (uint32_t idx = 0; idx < np; ++idx)
+            process_pair(idx, d_pairs, bv, sv, hv, mv, cv);
+    });
 }
 
 } // namespace dyphur

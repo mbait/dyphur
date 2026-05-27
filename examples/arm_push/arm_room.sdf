@@ -1,0 +1,117 @@
+<?xml version="1.0"?>
+<sdf version="1.9">
+  <world name="arm_room">
+
+    <!-- Static floor: 4×4 m, 5 cm thick, top surface at z=0 -->
+    <model name="floor">
+      <static>true</static>
+      <link name="link">
+        <pose>0 0 -0.025 0 0 0</pose>
+        <collision name="col">
+          <geometry><box><size>4 4 0.05</size></box></geometry>
+        </collision>
+      </link>
+    </model>
+
+    <!--
+      Two pushable boxes placed on the ±Y axis.
+      The arm bar starts pointing along ±X (θ=0) so these are OUTSIDE the
+      arm's initial footprint (arm y-extent is only ±0.03 m).
+      When the PD motor sweeps the arm toward ±π/2, the arm end
+      (r=0.8 m) contacts the box face at y≈±0.75 m.
+    -->
+    <model name="box_a">
+      <link name="link">
+        <pose>0 0.75 0.05 0 0 0</pose>
+        <inertial>
+          <mass>0.5</mass>
+          <inertia>
+            <ixx>0.000833</ixx><iyy>0.000833</iyy><izz>0.000833</izz>
+            <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+          </inertia>
+        </inertial>
+        <collision name="col">
+          <geometry><box><size>0.1 0.1 0.1</size></box></geometry>
+        </collision>
+      </link>
+    </model>
+
+    <model name="box_b">
+      <link name="link">
+        <pose>0 -0.75 0.05 0 0 0</pose>
+        <inertial>
+          <mass>0.5</mass>
+          <inertia>
+            <ixx>0.000833</ixx><iyy>0.000833</iyy><izz>0.000833</izz>
+            <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+          </inertia>
+        </inertial>
+        <collision name="col">
+          <geometry><box><size>0.1 0.1 0.1</size></box></geometry>
+        </collision>
+      </link>
+    </model>
+
+    <!--
+      1-DOF planar arm (sweeps in XY plane).
+
+      base  : 0.15×0.15×0.05 m block, centre at z=0.025, top at z=0.05.
+               Mass=1000 kg (de-facto static; supported by floor contact).
+      link1 : 1.6×0.06×0.06 m bar, COM at z=0.05 (= joint frame).
+               At θ=0 it lies along ±X; at θ=±π/2 it lies along ±Y.
+      joint j0: revolute around Z at link1 origin (SDF default joint pose
+               is in child frame, so <pose>0 0 0</pose> = link1 origin).
+               anchor_parent in our loader = (0,0,0.025) [top of base].
+               anchor_child   = (0,0,0) [link1 COM = joint frame].
+    -->
+    <model name="arm">
+      <link name="base">
+        <pose>0 0 0.025 0 0 0</pose>
+        <inertial>
+          <mass>1000</mass>
+          <inertia>
+            <ixx>2.083</ixx><iyy>2.083</iyy><izz>3.750</izz>
+            <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+          </inertia>
+        </inertial>
+        <collision name="col">
+          <geometry><box><size>0.15 0.15 0.05</size></box></geometry>
+        </collision>
+      </link>
+
+      <link name="link1">
+        <!--
+          COM at z=0.10 so the link shape (half_z=0.03, extends z:[0.07,0.13])
+          has a 2 cm gap above the base top (z=0.05).  No self-contact.
+          anchor_parent = joint_world_z − base_COM_z = 0.10 − 0.025 = 0.075.
+        -->
+        <pose>0 0 0.10 0 0 0</pose>
+        <inertial>
+          <mass>2</mass>
+          <inertia>
+            <ixx>0.0012</ixx><iyy>0.4274</iyy><izz>0.4274</izz>
+            <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+          </inertia>
+        </inertial>
+        <collision name="col">
+          <geometry><box><size>1.6 0.06 0.06</size></box></geometry>
+        </collision>
+      </link>
+
+      <joint name="j0" type="revolute">
+        <parent>base</parent>
+        <child>link1</child>
+        <!-- Default: joint pose in child (link1) frame → at link1 origin = (0,0,0.10). -->
+        <pose>0 0 0 0 0 0</pose>
+        <axis>
+          <xyz>0 0 1</xyz>
+          <limit>
+            <lower>-1.5708</lower>
+            <upper>1.5708</upper>
+          </limit>
+        </axis>
+      </joint>
+    </model>
+
+  </world>
+</sdf>

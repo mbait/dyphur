@@ -68,24 +68,38 @@ inline float gen_inv_mass(const BodyView& bv, uint32_t bi,
     return bv.inv_mass[bi] + (rxnx*ix + rxny*iy + rxnz*iz);
 }
 
-// Apply a positional impulse (sign * Δλ * n) to body bi, updating position
-// and quaternion.  sign = +1 for the "pushed away" body, -1 for the other.
+// Apply a positional impulse (sign * Δλ * n) to body bi, updating position,
+// quaternion, and linear velocity (XPBD velocity step: Δv = Δx / h).
+// inv_dt = 1/h; pass 0 only for contact constraints that handle velocity separately.
 inline void apply_pos_impulse(const BodyView& bv, uint32_t bi, float sign,
                                float delta_lambda,
                                float nx, float ny, float nz,
-                               float rx, float ry, float rz) {
+                               float rx, float ry, float rz,
+                               float inv_dt) {
     float im = bv.inv_mass[bi];
-    bv.pos_x[bi] += sign * im * delta_lambda * nx;
-    bv.pos_y[bi] += sign * im * delta_lambda * ny;
-    bv.pos_z[bi] += sign * im * delta_lambda * nz;
+    float dx = sign * im * delta_lambda * nx;
+    float dy = sign * im * delta_lambda * ny;
+    float dz = sign * im * delta_lambda * nz;
+    bv.pos_x[bi] += dx;
+    bv.pos_y[bi] += dy;
+    bv.pos_z[bi] += dz;
+    // Velocity update so joint-constrained bodies don't accumulate gravity drift
+    // between integration and constraint correction.
+    bv.vel_x[bi] += dx * inv_dt;
+    bv.vel_y[bi] += dy * inv_dt;
+    bv.vel_z[bi] += dz * inv_dt;
 
     // Angular: ω = I_w^-1 * (r × (sign * Δλ * n))
     float rx_n_x = ry*nz - rz*ny, rx_n_y = rz*nx - rx*nz, rx_n_z = rx*ny - ry*nx;
     float ix, iy, iz;
     world_inv_inertia(bv, bi, rx_n_x, rx_n_y, rx_n_z, ix, iy, iz);
-    apply_ang_delta(bv, bi, sign * delta_lambda * ix,
-                            sign * delta_lambda * iy,
-                            sign * delta_lambda * iz);
+    float dix = sign * delta_lambda * ix;
+    float diy = sign * delta_lambda * iy;
+    float diz = sign * delta_lambda * iz;
+    apply_ang_delta(bv, bi, dix, diy, diz);
+    bv.ang_x[bi] += dix * inv_dt;
+    bv.ang_y[bi] += diy * inv_dt;
+    bv.ang_z[bi] += diz * inv_dt;
 }
 
 // ── 3D positional constraint between two bodies ──────────────────────────────
@@ -95,6 +109,7 @@ inline bool solve_pos_constraint(const BodyView& bv,
                                   float rax, float ray, float raz,  // world-frame lever arm a
                                   float rbx, float rby, float rbz,
                                   float alpha_h2,                   // compliance / h²
+                                  float inv_dt,
                                   float eps = 1e-7f) {
     float cx = (bv.pos_x[ia] + rax) - (bv.pos_x[ib] + rbx);
     float cy = (bv.pos_y[ia] + ray) - (bv.pos_y[ib] + rby);
@@ -111,8 +126,8 @@ inline bool solve_pos_constraint(const BodyView& bv,
     if (w < 1e-10f) return false;
 
     float dl = -c_len / w;
-    apply_pos_impulse(bv, ia, +1.f, dl, nx, ny, nz, rax, ray, raz);
-    apply_pos_impulse(bv, ib, -1.f, dl, nx, ny, nz, rbx, rby, rbz);
+    apply_pos_impulse(bv, ia, +1.f, dl, nx, ny, nz, rax, ray, raz, inv_dt);
+    apply_pos_impulse(bv, ib, -1.f, dl, nx, ny, nz, rbx, rby, rbz, inv_dt);
     return true;
 }
 
@@ -124,7 +139,8 @@ inline void solve_transverse_pos(const BodyView& bv,
                                   float rax, float ray, float raz,
                                   float rbx, float rby, float rbz,
                                   float axw, float ayw, float azw,  // joint axis, world frame
-                                  float alpha_h2) {
+                                  float alpha_h2,
+                                  float inv_dt) {
     float cx = (bv.pos_x[ia] + rax) - (bv.pos_x[ib] + rbx);
     float cy = (bv.pos_y[ia] + ray) - (bv.pos_y[ib] + rby);
     float cz = (bv.pos_z[ia] + raz) - (bv.pos_z[ib] + rbz);
@@ -143,8 +159,8 @@ inline void solve_transverse_pos(const BodyView& bv,
     if (w < 1e-10f) return;
 
     float dl = -t_len / w;
-    apply_pos_impulse(bv, ia, +1.f, dl, nx, ny, nz, rax, ray, raz);
-    apply_pos_impulse(bv, ib, -1.f, dl, nx, ny, nz, rbx, rby, rbz);
+    apply_pos_impulse(bv, ia, +1.f, dl, nx, ny, nz, rax, ray, raz, inv_dt);
+    apply_pos_impulse(bv, ib, -1.f, dl, nx, ny, nz, rbx, rby, rbz, inv_dt);
 }
 
 // ── Angular constraint between two bodies along a world-space direction ───────
@@ -152,7 +168,8 @@ inline void solve_transverse_pos(const BodyView& bv,
 inline void solve_ang_constraint(const BodyView& bv,
                                   uint32_t ia, uint32_t ib,
                                   float cx, float cy, float cz,
-                                  float alpha_h2) {
+                                  float alpha_h2,
+                                  float inv_dt = 0.f) {
     float c2 = cx*cx + cy*cy + cz*cz;
     if (c2 < 1e-14f) return;
 
@@ -170,12 +187,18 @@ inline void solve_ang_constraint(const BodyView& bv,
     float dl = -c_len / w;
     apply_ang_delta(bv, ia, -dl*ix, -dl*iy, -dl*iz);
     apply_ang_delta(bv, ib,  dl*jx,  dl*jy,  dl*jz);
+    bv.ang_x[ia] += (-dl*ix) * inv_dt;
+    bv.ang_y[ia] += (-dl*iy) * inv_dt;
+    bv.ang_z[ia] += (-dl*iz) * inv_dt;
+    bv.ang_x[ib] += (dl*jx) * inv_dt;
+    bv.ang_y[ib] += (dl*jy) * inv_dt;
+    bv.ang_z[ib] += (dl*jz) * inv_dt;
 }
 
 // ── Full quaternion angular constraint (Fixed joint) ─────────────────────────
 // q_rel = conj(q_ia) * q_ib; violation = 2 * q_rel.xyz rotated to world frame.
 inline void solve_fixed_ang(const BodyView& bv, uint32_t ia, uint32_t ib,
-                              float alpha_h2) {
+                              float alpha_h2, float inv_dt = 0.f) {
     // q_rel = conj(q_a) * q_b
     float aw = bv.rot_w[ia], ax = bv.rot_x[ia], ay = bv.rot_y[ia], az = bv.rot_z[ia];
     float bw = bv.rot_w[ib], bx = bv.rot_x[ib], by = bv.rot_y[ib], bz = bv.rot_z[ib];
@@ -190,7 +213,7 @@ inline void solve_fixed_ang(const BodyView& bv, uint32_t ia, uint32_t ib,
     float cx, cy, cz;
     qrot_to_world(bv, ia, rx, ry, rz, cx, cy, cz);
     cx *= 2.f; cy *= 2.f; cz *= 2.f;
-    solve_ang_constraint(bv, ia, ib, cx, cy, cz, alpha_h2);
+    solve_ang_constraint(bv, ia, ib, cx, cy, cz, alpha_h2, inv_dt);
 }
 
 // ── Revolute axis-alignment constraint ────────────────────────────────────────
@@ -198,7 +221,7 @@ inline void solve_fixed_ang(const BodyView& bv, uint32_t ia, uint32_t ib,
 // C = axis_ia × axis_ib  (zero when aligned; magnitude = sin of misalignment).
 inline void solve_revolute_ang(const BodyView& bv, uint32_t ia, uint32_t ib,
                                 float ax_local, float ay_local, float az_local,
-                                float alpha_h2) {
+                                float alpha_h2, float inv_dt = 0.f) {
     float ax_ia, ay_ia, az_ia;
     qrot_to_world(bv, ia, ax_local, ay_local, az_local, ax_ia, ay_ia, az_ia);
     float ax_ib, ay_ib, az_ib;
@@ -210,7 +233,7 @@ inline void solve_revolute_ang(const BodyView& bv, uint32_t ia, uint32_t ib,
     float cx = ay_ia*az_ib - az_ia*ay_ib;
     float cy = az_ia*ax_ib - ax_ia*az_ib;
     float cz = ax_ia*ay_ib - ay_ia*ax_ib;
-    solve_ang_constraint(bv, ia, ib, cx, cy, cz, alpha_h2);
+    solve_ang_constraint(bv, ia, ib, cx, cy, cz, alpha_h2, inv_dt);
 }
 
 // ── Revolute / Prismatic limit constraint ─────────────────────────────────────
@@ -260,7 +283,7 @@ inline float joint_current_value(const BodyView& bv,
 inline void apply_limit(const BodyView& bv, uint32_t ia, uint32_t ib,
                          float ax_local, float ay_local, float az_local,
                          float limit_lo, float limit_hi, float h,
-                         uint8_t type) {
+                         uint8_t type, float inv_dt) {
     if (limit_lo > limit_hi) return;  // limits disabled
     float val = joint_current_value(bv, ia, ib, ax_local, ay_local, az_local, type);
     float viol = 0.f;
@@ -279,8 +302,8 @@ inline void apply_limit(const BodyView& bv, uint32_t ia, uint32_t ib,
         float w  = wa + wb;
         if (w < 1e-10f) return;
         float dl = -viol / w;
-        apply_pos_impulse(bv, ia, +1.f, dl, nx, ny, nz, 0,0,0);
-        apply_pos_impulse(bv, ib, -1.f, dl, nx, ny, nz, 0,0,0);
+        apply_pos_impulse(bv, ia, +1.f, dl, nx, ny, nz, 0,0,0, inv_dt);
+        apply_pos_impulse(bv, ib, -1.f, dl, nx, ny, nz, 0,0,0, inv_dt);
     } else {
         // Angular correction: push the relative rotation back inside [lo, hi]
         float cx = viol * ax_w, cy = viol * ay_w, cz = viol * az_w;
@@ -332,7 +355,8 @@ inline void apply_motor(const BodyView& bv, uint32_t ia, uint32_t ib,
         float wb = bv.inv_mass[ib];
         float w  = wa + wb;
         if (w < 1e-10f) return;
-        float j = (stiffness * pos_error * h + damping * vel_error) / w;
+        // Both stiffness and damping generate torques integrated over h → impulse = torque * h.
+        float j = (stiffness * pos_error + damping * vel_error) * h / w;
         bv.vel_x[ia] -= wa * j * ax_w; bv.vel_y[ia] -= wa * j * ay_w; bv.vel_z[ia] -= wa * j * az_w;
         bv.vel_x[ib] += wb * j * ax_w; bv.vel_y[ib] += wb * j * ay_w; bv.vel_z[ib] += wb * j * az_w;
     } else {
@@ -342,7 +366,7 @@ inline void apply_motor(const BodyView& bv, uint32_t ia, uint32_t ib,
         float wb = ax_w*ix_b + ay_w*iy_b + az_w*iz_b;
         float w  = wa + wb;
         if (w < 1e-10f) return;
-        float j = (stiffness * pos_error * h + damping * vel_error) / w;
+        float j = (stiffness * pos_error + damping * vel_error) * h / w;
         bv.ang_x[ia] -= j * ix_a; bv.ang_y[ia] -= j * iy_a; bv.ang_z[ia] -= j * iz_a;
         bv.ang_x[ib] += j * ix_b; bv.ang_y[ib] += j * iy_b; bv.ang_z[ib] += j * iz_b;
     }
@@ -366,6 +390,22 @@ void XpbdSolver::solve(Stream& s, const ContactView& cv,
     parallel_for(s, 1, [cv, jv, bv, ni, mu, lc, dt](size_t) {
         uint32_t nc = *cv.n;
         uint32_t nj = jv.n;
+
+        // Apply PD motors once per timestep (before the GS loop).
+        // Motors modify velocities; applying them inside the GS loop creates
+        // a feedback oscillation (vel_rel changes each iteration, sign-flipping
+        // the damping term) that diverges.
+        for (uint32_t j = 0; j < nj; ++j) {
+            uint32_t ia = jv.body_parent[j], ib = jv.body_child[j];
+            uint8_t  jtype = jv.type[j];
+            float alx = jv.axis_px[j], aly = jv.axis_py[j], alz = jv.axis_pz[j];
+            if (jtype == static_cast<uint8_t>(JointType::Revolute) ||
+                jtype == static_cast<uint8_t>(JointType::Prismatic)) {
+                apply_motor(bv, ia, ib, alx, aly, alz,
+                            jv.target_pos[j], jv.target_vel[j],
+                            jv.stiffness[j], jv.damping[j], dt, jtype);
+            }
+        }
 
         for (int iter = 0; iter < ni; ++iter) {
 
@@ -477,36 +517,29 @@ void XpbdSolver::solve(Stream& s, const ContactView& cv,
                 float alpha_pos = jv.compliance_pos[j] / (dt * dt);
                 float alpha_ang = jv.compliance_ang[j] / (dt * dt);
                 float alx = jv.axis_px[j], aly = jv.axis_py[j], alz = jv.axis_pz[j];
+                float inv_dt = 1.f / dt;
 
                 if (jtype == static_cast<uint8_t>(JointType::Prismatic)) {
                     // Prismatic: fully constrained angular, 2-transverse positional
                     float axw, ayw, azw;
                     qrot_to_world(bv, ia, alx, aly, alz, axw, ayw, azw);
-                    solve_fixed_ang(bv, ia, ib, alpha_ang);
+                    solve_fixed_ang(bv, ia, ib, alpha_ang, inv_dt);
                     solve_transverse_pos(bv, ia, ib, rax, ray, raz, rbx, rby, rbz,
-                                         axw, ayw, azw, alpha_pos);
+                                         axw, ayw, azw, alpha_pos, inv_dt);
                     apply_limit(bv, ia, ib, alx, aly, alz,
-                                jv.limit_lo[j], jv.limit_hi[j], dt, jtype);
+                                jv.limit_lo[j], jv.limit_hi[j], dt, jtype, inv_dt);
                 } else {
                     // Ball, Fixed, Revolute: all have 3D positional constraint
-                    solve_pos_constraint(bv, ia, ib, rax, ray, raz, rbx, rby, rbz, alpha_pos);
+                    solve_pos_constraint(bv, ia, ib, rax, ray, raz, rbx, rby, rbz, alpha_pos, inv_dt);
 
                     if (jtype == static_cast<uint8_t>(JointType::Fixed)) {
-                        solve_fixed_ang(bv, ia, ib, alpha_ang);
+                        solve_fixed_ang(bv, ia, ib, alpha_ang, inv_dt);
                     } else if (jtype == static_cast<uint8_t>(JointType::Revolute)) {
-                        solve_revolute_ang(bv, ia, ib, alx, aly, alz, alpha_ang);
+                        solve_revolute_ang(bv, ia, ib, alx, aly, alz, alpha_ang, inv_dt);
                         apply_limit(bv, ia, ib, alx, aly, alz,
-                                    jv.limit_lo[j], jv.limit_hi[j], dt, jtype);
+                                    jv.limit_lo[j], jv.limit_hi[j], dt, jtype, inv_dt);
                     }
                     // Ball: no angular constraint
-                }
-
-                // PD motor (velocity correction, applied each iteration for implicit damping)
-                if (jtype == static_cast<uint8_t>(JointType::Revolute) ||
-                    jtype == static_cast<uint8_t>(JointType::Prismatic)) {
-                    apply_motor(bv, ia, ib, alx, aly, alz,
-                                jv.target_pos[j], jv.target_vel[j],
-                                jv.stiffness[j], jv.damping[j], dt, jtype);
                 }
             } // end joint loop
 

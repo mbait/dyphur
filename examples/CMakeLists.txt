@@ -1,3 +1,4 @@
 add_subdirectory(stress_test_blocks)
 add_subdirectory(manipulator_pick)
 add_subdirectory(sdf_scene)
+add_subdirectory(arm_push)

@@ -221,7 +221,7 @@ TEST_CASE("sim determinism: 8 boxes + ground, 20 frames", "[determinism]") {
 
 TEST_CASE("sim determinism: 2-link articulated arm, 20 frames", "[determinism]") {
     // CPU (OMP) golden — must be re-derived if physics logic changes.
-    constexpr uint64_t GOLDEN = 0xa417e4fb155bea78ULL;
+    constexpr uint64_t GOLDEN = 0x44d086af21f338cfULL;
 
     Device dev = Device::default_cpu();
 

@@ -123,30 +123,26 @@ SceneDesc load_sdf(const std::string& path, const SdfLoadParams& p)
 
     SceneDesc scene;
 
-    // Helper: name → body index map
-    std::map<std::string, uint32_t> name_to_idx;
+    // Helper: name → body index map and name → world pose map
+    std::map<std::string, uint32_t>         name_to_idx;
+    std::map<std::string, gz::math::Pose3d> name_to_world_pose;
 
     auto process_model = [&](const sdf::Model* model) {
         std::string model_name = model->Name();
 
-        // Canonical pose of the model in the world frame
-        gz::math::Pose3d model_world_pose;
-        {
-            sdf::Errors pe;
-            model->SemanticPose().Resolve(model_world_pose, "world");
-            (void)pe;
-        }
+        // Model's pose in the world frame: use RawPose (pose in parent = world).
+        // SemanticPose().Resolve("world") silently fails when the libsdformat
+        // pose graph doesn't have a registered "world" frame node, returning
+        // identity. RawPose() always returns the literal <pose> from the SDF.
+        gz::math::Pose3d model_world_pose = model->RawPose();
 
         for (uint64_t li = 0; li < model->LinkCount(); ++li) {
             const sdf::Link* link = model->LinkByIndex(li);
             std::string link_name = model_name + "::" + link->Name();
 
-            gz::math::Pose3d link_world_pose;
-            {
-                sdf::Errors pe;
-                link->SemanticPose().Resolve(link_world_pose, "world");
-                (void)pe;
-            }
+            // Link pose in model frame, composed with model-in-world pose.
+            gz::math::Pose3d link_world_pose = model_world_pose * link->RawPose();
+            name_to_world_pose[link_name] = link_world_pose;
 
             BodyDesc bd;
             bd.name = link_name;
@@ -291,17 +287,24 @@ SceneDesc load_sdf(const std::string& path, const SdfLoadParams& p)
                 jp.limit_lo = -1e10f; jp.limit_hi = 1e10f;
             }
 
-            // Anchor: joint origin in parent frame
-            gz::math::Pose3d joint_pose;
-            {
-                sdf::Errors pe;
-                joint->SemanticPose().Resolve(joint_pose, parent_full);
-                (void)pe;
-            }
+            // Anchor: joint origin in parent body frame.
+            // In SDF 1.8+ the joint <pose> is in the child link frame by default.
+            // Compute joint world pos = child_world * joint_raw_pose, then express
+            // that in the parent body frame.
+            gz::math::Pose3d child_world_pose;
+            gz::math::Pose3d parent_world_pose;
+            if (name_to_world_pose.count(child_full))
+                child_world_pose  = name_to_world_pose.at(child_full);
+            if (name_to_world_pose.count(parent_full))
+                parent_world_pose = name_to_world_pose.at(parent_full);
+
+            gz::math::Pose3d joint_world_pose = child_world_pose * joint->RawPose();
+            gz::math::Pose3d anchor_in_parent  = parent_world_pose.Inverse() * joint_world_pose;
+
             jp.anchor_parent = Vec3f{
-                static_cast<float>(joint_pose.Pos().X()) * p.scale,
-                static_cast<float>(joint_pose.Pos().Y()) * p.scale,
-                static_cast<float>(joint_pose.Pos().Z()) * p.scale};
+                static_cast<float>(anchor_in_parent.Pos().X()) * p.scale,
+                static_cast<float>(anchor_in_parent.Pos().Y()) * p.scale,
+                static_cast<float>(anchor_in_parent.Pos().Z()) * p.scale};
             jp.anchor_child = Vec3f{0.f, 0.f, 0.f};
 
             jp.stiffness     = 0.f;

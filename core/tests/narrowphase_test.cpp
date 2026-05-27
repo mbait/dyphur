@@ -151,7 +151,7 @@ TEST_CASE("Narrowphase: sphere-box contact", "[narrowphase][smoke]") {
 }
 
 // Two 1×1×1 boxes: A at (0,0,0), B at (1.8,0,0). Overlap=0.2.
-// Expect 4 vertex contacts at x=1.0, depth=0.2, N=(-1,0,0).
+// Expect 1 centroid contact at x=1.0, depth=0.2, N=(-1,0,0).
 TEST_CASE("Narrowphase: box-box face contact", "[narrowphase][smoke]") {
     auto dev = Device::default_cpu();
     auto s   = dev.make_stream();
@@ -175,14 +175,12 @@ TEST_CASE("Narrowphase: box-box face contact", "[narrowphase][smoke]") {
     s.wait();
 
     auto c = download_contacts(s, np);
-    REQUIRE(c.n == 4u);
-    for (uint32_t i = 0; i < c.n; ++i) {
-        REQUIRE_THAT(c.depth[i], WithinAbs(0.2f, kEps));
-        REQUIRE_THAT(c.nx[i],    WithinAbs(-1.f, kEps));
-        REQUIRE_THAT(c.ny[i],    WithinAbs(0.f,  kEps));
-        REQUIRE_THAT(c.nz[i],    WithinAbs(0.f,  kEps));
-        REQUIRE_THAT(c.px[i],    WithinAbs(1.f,  kEps));
-    }
+    REQUIRE(c.n == 1u);
+    REQUIRE_THAT(c.depth[0], WithinAbs(0.2f, kEps));
+    REQUIRE_THAT(c.nx[0],    WithinAbs(-1.f, kEps));
+    REQUIRE_THAT(c.ny[0],    WithinAbs(0.f,  kEps));
+    REQUIRE_THAT(c.nz[0],    WithinAbs(0.f,  kEps));
+    REQUIRE_THAT(c.px[0],    WithinAbs(1.f,  kEps));
 }
 
 // Two 1×1×1 boxes 5 units apart — no contact.

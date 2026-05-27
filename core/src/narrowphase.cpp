@@ -990,8 +990,15 @@ void Narrowphase::run(Stream& s,
             int nc = box_box(bv.pos_x[ia], bv.pos_y[ia], bv.pos_z[ia], Ae, Ah,
                              bv.pos_x[ib], bv.pos_y[ib], bv.pos_z[ib], Be_m, Bh,
                              opx, opy, opz, onx, ony, onz, od);
-            for (int k = 0; k < nc; ++k)
-                emit(cv, ia, ib, opx[k], opy[k], opz[k], onx, ony, onz, od[k]);
+            // Reduce multi-point manifold to one centroid contact: sequential
+            // application of 4 angular corrections causes non-commutative quaternion
+            // drift that accumulates and destabilizes the simulation.
+            if (nc > 0) {
+                float cx = 0, cy = 0, cz = 0, cd = 0;
+                for (int k = 0; k < nc; ++k) { cx+=opx[k]; cy+=opy[k]; cz+=opz[k]; cd+=od[k]; }
+                float inv = 1.f / nc;
+                emit(cv, ia, ib, cx*inv, cy*inv, cz*inv, onx, ony, onz, cd*inv);
+            }
             continue;
         }
 

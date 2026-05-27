@@ -20,6 +20,10 @@ compile_commands.json
 vcpkg_installed/
 .vcpkg-root
 
+# Documentation build artifacts
+docs/_build/
+docs/doxygen-xml/
+
 # Python
 __pycache__/
 *.pyc

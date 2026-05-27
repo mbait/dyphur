@@ -37,6 +37,22 @@ add_subdirectory(bindings/python)
 # ── Install / package export ──────────────────────────────────────────────────
 include(CMakePackageConfigHelpers)
 
+# ── Documentation ─────────────────────────────────────────────────────────────
+find_program(DOXYGEN_EXECUTABLE doxygen)
+set(NB_VENV_SPHINX "${CMAKE_SOURCE_DIR}/.venv/bin/sphinx-build")
+
+if(DOXYGEN_EXECUTABLE AND EXISTS "${NB_VENV_SPHINX}")
+    add_custom_target(docs
+        COMMAND "${DOXYGEN_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/docs/Doxyfile"
+        COMMAND "${NB_VENV_SPHINX}" -b html
+                "${CMAKE_SOURCE_DIR}/docs"
+                "${CMAKE_SOURCE_DIR}/docs/_build/html"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/docs"
+        COMMENT "Generating Doxygen XML then Sphinx HTML documentation"
+        VERBATIM
+    )
+endif()
+
 install(TARGETS dyphur_compute
         EXPORT dyphurTargets)
 

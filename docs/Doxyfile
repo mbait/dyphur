@@ -1,0 +1,33 @@
+PROJECT_NAME           = "dyphur"
+PROJECT_NUMBER         = 0.0.1
+PROJECT_BRIEF          = "GPU-first rigid-body physics framework for robotics simulation"
+
+# Input
+INPUT                  = ../compute/include \
+                         ../core/include
+RECURSIVE              = YES
+FILE_PATTERNS          = *.hpp *.h
+EXCLUDE_PATTERNS       = */vcpkg/* */build/* */.venv/*
+
+# Output: XML only (Sphinx/Breathe renders HTML)
+OUTPUT_DIRECTORY       = doxygen-xml
+GENERATE_XML           = YES
+GENERATE_HTML          = NO
+GENERATE_LATEX         = NO
+
+XML_OUTPUT             = xml
+
+# Extraction
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = NO
+SHOW_INCLUDE_FILES     = YES
+
+# Preprocessor
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+PREDEFINED             = SYCL_EXTERNAL=
+
+# Quiet mode
+QUIET                  = YES
+WARNINGS               = YES

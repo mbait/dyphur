@@ -3,6 +3,7 @@ add_library(dyphur_core STATIC
     src/integrator.cpp
     src/shapes.cpp
     src/broadphase.cpp
+    src/ray_query.cpp
     src/contact_store.cpp
     src/narrowphase.cpp
     src/xpbd_solver.cpp
@@ -16,6 +17,7 @@ add_sycl_to_target(TARGET dyphur_core SOURCES
     src/integrator.cpp
     src/shapes.cpp
     src/broadphase.cpp
+    src/ray_query.cpp
     src/contact_store.cpp
     src/narrowphase.cpp
     src/xpbd_solver.cpp

@@ -13,6 +13,24 @@ struct ContactPair {
     uint32_t a, b;  // body indices, a < b always
 };
 
+// Read-only view of BVH internals exposed for ray-query traversal.
+// Pointers are valid until the next build_and_query() call.
+// n: number of active leaves (== body count passed to build_and_query).
+struct BvhView {
+    const int32_t*    left;        // internal nodes [0, n-2]
+    const int32_t*    right;       // internal nodes [0, n-2]
+    const int32_t*    parent;      // all nodes [0, 2n-2]
+    const int32_t*    root;        // 1 element: root internal node index
+    const uint32_t*   sorted_idx;  // leaf k → original body index
+    const sycl::half* aabb_min_x;
+    const sycl::half* aabb_min_y;
+    const sycl::half* aabb_min_z;
+    const sycl::half* aabb_max_x;
+    const sycl::half* aabb_max_y;
+    const sycl::half* aabb_max_z;
+    uint32_t n;
+};
+
 // LBVH broadphase (Karras 2012).
 //
 // Build flow per frame:
@@ -52,6 +70,10 @@ public:
 
     // Blocking download of the pair count.
     uint32_t download_count(Stream& s) const;
+
+    // Read-only view into the BVH built by the most recent build_and_query().
+    // n_active: the body count that was passed to build_and_query().
+    BvhView bvh_view(uint32_t n_active) const noexcept;
 
 private:
     uint32_t max_bodies_ = 0;

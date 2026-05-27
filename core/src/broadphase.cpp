@@ -368,4 +368,21 @@ uint32_t Broadphase::download_count(Stream& s) const {
     return cnt;
 }
 
+BvhView Broadphase::bvh_view(uint32_t n_active) const noexcept {
+    return BvhView{
+        d_left_.data(),
+        d_right_.data(),
+        d_parent_.data(),
+        d_root_.data(),
+        d_sorted_idx_.data(),
+        d_aabb_min_x_.data(),
+        d_aabb_min_y_.data(),
+        d_aabb_min_z_.data(),
+        d_aabb_max_x_.data(),
+        d_aabb_max_y_.data(),
+        d_aabb_max_z_.data(),
+        n_active,
+    };
+}
+
 } // namespace dyphur

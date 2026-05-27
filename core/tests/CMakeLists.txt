@@ -78,6 +78,15 @@ target_link_libraries(test_core_sim_determinism PRIVATE
 add_sycl_to_target(TARGET test_core_sim_determinism SOURCES sim_determinism_test.cpp)
 dyphur_add_determinism_test(test_core_sim_determinism)
 
+# Ray-query test: BVH traversal + exact sphere/box intersection, requires SYCL.
+add_executable(test_core_ray_query ray_query_test.cpp)
+target_link_libraries(test_core_ray_query PRIVATE
+    dyphur::core
+    Catch2::Catch2WithMain
+)
+add_sycl_to_target(TARGET test_core_ray_query SOURCES ray_query_test.cpp)
+dyphur_add_smoke_test(test_core_ray_query)
+
 # Per-stage microbenchmarks: integrator / broadphase / narrowphase / solver.
 # Run with: test_core_bench --benchmark-samples 20 --reporter json > bench.json
 add_executable(test_core_bench physics_benchmark.cpp)

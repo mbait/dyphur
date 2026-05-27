@@ -297,6 +297,49 @@ each round-trip is ~0.3–1 ms.  At 51 fps (19.6 ms/frame), removing
 
 ---
 
+---
+
+## Issue 3 — `test_core_articulation` SIGSEGV on "Fixed joint" and "Revolute joint" cases
+
+**Status**: deterministic crash on every run (OMP and CUDA)
+**Affected tests**: "Fixed joint: static parent, dynamic child pulled to constraint" and
+"Revolute joint: anchor constraint satisfied, axis alignment preserved"
+**Not affected**: "Ball joint: violation corrected to constraint satisfaction" (runs but numerical assertion fails)
+
+### Symptom
+
+```
+FAILED:
+due to a fatal error condition:
+  SIGSEGV - Segmentation violation signal
+```
+
+The segfault occurs inside the articulation solver kernel, before any assertions run.
+The "Ball joint" case does not segfault but fails a `WithinAbs(0.f, 1e-3f)` check with
+error ≈ 0.06 (constraint not converged).
+
+### Root cause (to be investigated)
+
+Likely candidates:
+- Out-of-bounds joint index or body index in the articulation kernel when the body count
+  changes between scenes (each test case builds a different JointStore).
+- Uninitialized device memory for the parent body in the "Fixed joint" case (the
+  static parent may not be uploaded to the device correctly).
+- Buffer size mismatch: `JointStore` or `ArticulationSolver` constructed with an
+  `n_joints` that doesn't match the actual joint count.
+
+**Starting point**: `core/tests/articulation_test.cpp:178` (Fixed joint setup) and
+`core/tests/articulation_test.cpp:221` (Revolute joint setup); the crash site is the
+first kernel launch after `solver.solve(s, ...)`.
+
+### Fix options
+
+Investigate with a debug build + ASAN or by adding bounds assertions in the articulation
+kernel before the first array access.  Likely a one-off setup error in the test or in
+`ArticulationSolver::solve()`.
+
+---
+
 ## Summary table
 
 | ID  | Issue                                              | File(s)                                          | Effort | Impact      |
@@ -305,6 +348,7 @@ each round-trip is ~0.3–1 ms.  At 51 fps (19.6 ms/frame), removing
 | 2a  | Bitonic sort: O(log²n) kernel launches (77% time)  | `compute/include/compute/sort.hpp`               | M      | ~3× fps     |
 | 2b  | Sequential BVH refit (`parallel_for(1u, ...)`)     | `core/src/broadphase.cpp:217`                    | S      | ~1.5× fps   |
 | 2c  | Extra `np.download_count` sync per frame           | `examples/stress_test_blocks/main.cpp:191`       | XS     | ~8% fps     |
+| 3   | `test_core_articulation` SIGSEGV (Fixed/Revolute)  | `core/tests/articulation_test.cpp:178, 221`      | S      | 2 tests crash |
 
-Fix order recommendation: 1 → 2c → 2b → 2a (ascending effort, each is
+Fix order recommendation: 1 → 2c → 3 → 2b → 2a (ascending effort, each is
 independent of the others).

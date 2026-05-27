@@ -5,6 +5,7 @@ add_library(dyphur_core STATIC
     src/broadphase.cpp
     src/ray_query.cpp
     src/contact_store.cpp
+    src/contact_sensor.cpp
     src/narrowphase.cpp
     src/xpbd_solver.cpp
     src/articulation.cpp

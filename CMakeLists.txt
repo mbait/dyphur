@@ -10,6 +10,7 @@ project(dyphur
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)  # required for Python shared module
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -31,7 +32,7 @@ add_subdirectory(compute)
 add_subdirectory(core)
 add_subdirectory(scene)
 add_subdirectory(examples)
-# add_subdirectory(bindings/python)  # enabled when nanobind module is implemented
+add_subdirectory(bindings/python)
 
 # ── Install / package export ──────────────────────────────────────────────────
 include(CMakePackageConfigHelpers)

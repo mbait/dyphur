@@ -44,6 +44,9 @@ public:
     uint32_t count()    const noexcept { return count_; }
     uint32_t capacity() const noexcept { return cap_; }
 
+    // Host-side body → shape index mapping; valid after add() calls.
+    const std::vector<uint32_t>& body_shapes() const noexcept { return h_shape_; }
+
 private:
     // Device buffers — one per SoA field, allocated at capacity.
     Buffer<float>    d_pos_x_, d_pos_y_, d_pos_z_;

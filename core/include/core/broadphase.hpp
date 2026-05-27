@@ -4,6 +4,7 @@
 #include "shapes.hpp"
 #include <compute/buffer.hpp>
 #include <compute/stream.hpp>
+#include <sycl/sycl.hpp>
 #include <cstdint>
 
 namespace dyphur {
@@ -69,8 +70,10 @@ private:
     Buffer<int32_t>  d_left_;      // size max_bodies-1: left child index of internal node i
     Buffer<int32_t>  d_right_;     // size max_bodies-1: right child index
     Buffer<int32_t>  d_parent_;    // size 2*max_bodies-1: parent index (-1 for root)
-    Buffer<float>    d_aabb_min_x_, d_aabb_min_y_, d_aabb_min_z_;
-    Buffer<float>    d_aabb_max_x_, d_aabb_max_y_, d_aabb_max_z_;
+    // BVH node AABBs stored as fp16 to halve traversal bandwidth.
+    // The broadphase is a coarse filter; false positives are OK.
+    Buffer<sycl::half> d_aabb_min_x_, d_aabb_min_y_, d_aabb_min_z_;
+    Buffer<sycl::half> d_aabb_max_x_, d_aabb_max_y_, d_aabb_max_z_;
     Buffer<uint32_t> d_flags_;     // size max_bodies-1: atomic refit counters
     Buffer<int32_t>  d_root_;      // 1 element: index of the root internal node
 

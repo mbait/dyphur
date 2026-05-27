@@ -1,11 +1,13 @@
 #include "core/math/math.hpp"
 #include "core/body.hpp"
 #include "core/articulation.hpp"
+#include "core/realtime_enforcer.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <type_traits>
 #include <cmath>
+#include <thread>
 
 using namespace dyphur;
 
@@ -168,4 +170,69 @@ TEST_CASE("JointParams: default construction", "[smoke]") {
 TEST_CASE("JointView: is trivially copyable", "[smoke]") {
     static_assert(std::is_trivially_copyable_v<JointView>,
         "JointView must be trivially copyable for safe kernel capture");
+}
+
+// ── RealtimeEnforcer ──────────────────────────────────────────────────────────
+
+TEST_CASE("RealtimeEnforcer: first begin_frame returns dt_nominal", "[smoke]") {
+    RealtimeEnforcer e;
+    float dt = e.begin_frame();
+    REQUIRE_THAT(dt, Catch::Matchers::WithinULP(1.f / 60.f, 0));
+}
+
+TEST_CASE("RealtimeEnforcer: dt is clamped to [dt_min, dt_max]", "[smoke]") {
+    RealtimeEnforcer::Params p;
+    p.dt_min = 1.f / 240.f;
+    p.dt_max = 1.f / 15.f;
+    RealtimeEnforcer e(p);
+
+    // Frame 1: nominal
+    e.begin_frame();
+    e.end_frame();
+
+    // Frame 2: wall time is very small (no sleep) → clamps to dt_min
+    float dt = e.begin_frame();
+    REQUIRE(dt >= p.dt_min);
+    REQUIRE(dt <= p.dt_max);
+}
+
+TEST_CASE("RealtimeEnforcer: limit_realtime paces to dt_nominal", "[smoke]") {
+    RealtimeEnforcer::Params p;
+    p.dt_nominal     = 1.f / 60.f;
+    p.limit_realtime = true;
+    RealtimeEnforcer e(p);
+
+    using Clock   = RealtimeEnforcer::Clock;
+    using Seconds = RealtimeEnforcer::Seconds;
+
+    e.begin_frame();
+    auto t0     = Clock::now();
+    e.end_frame();
+    double wall = Seconds(Clock::now() - t0).count();
+
+    // Should have slept to fill out ~1/60 s; allow ±5 ms tolerance.
+    REQUIRE(wall >= p.dt_nominal - 0.005f);
+}
+
+TEST_CASE("RealtimeEnforcer: realtime_factor is positive after two frames", "[smoke]") {
+    RealtimeEnforcer e;
+    e.begin_frame();
+    e.end_frame();
+    e.begin_frame();
+    e.end_frame();
+    REQUIRE(e.realtime_factor() > 0.f);
+}
+
+TEST_CASE("RealtimeEnforcer: fast sim has realtime_factor >> 1", "[smoke]") {
+    RealtimeEnforcer::Params p;
+    p.limit_realtime = false;
+    RealtimeEnforcer e(p);
+
+    // Spin 10 frames with no work — should be much faster than realtime.
+    for (int i = 0; i < 10; ++i) {
+        e.begin_frame();
+        e.end_frame();
+    }
+    // Running 60 Hz frames with zero work → wall << sim time → factor >> 1.
+    REQUIRE(e.realtime_factor() > 1.f);
 }

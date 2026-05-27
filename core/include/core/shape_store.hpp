@@ -20,8 +20,10 @@ public:
 private:
     Buffer<uint32_t> d_type_;
     Buffer<float>    d_half_x_, d_half_y_, d_half_z_;
+    Buffer<uint32_t> d_ext_id_;
     std::vector<uint32_t> h_type_;
     std::vector<float>    h_half_x_, h_half_y_, h_half_z_;
+    std::vector<uint32_t> h_ext_id_;
     uint32_t count_ = 0, cap_ = 0;
 };
 

@@ -13,14 +13,8 @@
       "name": "catch2",
       "version>=": "3.4.0"
     },
-    "tracy"
-  ],
-  "features": {
-    "scene": {
-      "description": "SDF/URDF scene loading (Phase 3).",
-      "dependencies": [
-        "sdformat14"
-      ]
-    }
-  }
+    "tracy",
+    "sdformat",
+    "v-hacd"
+  ]
 }

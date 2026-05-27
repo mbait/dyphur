@@ -189,6 +189,62 @@ determinism gate passes (2-link arm, 20 frames, golden hash hardcoded in CI).
 - V-HACD / CoACD convex decomposition pipeline for non-convex meshes (CPU at load time, GPU buffers produced).
 - Triangle-mesh BVH for static geometry; dynamic-vs-static narrowphase via mesh-BVH traversal on GPU.
 
+**Design decisions (locked)**:
+
+- **SDF coordinate frame**: z-up (SDF native convention). Gravity is set to `{0, 0, -9.81f}` in z-up
+  frame; no coordinate transform is applied to poses or axes loaded from SDF. This matches Gazebo's
+  native convention and avoids a lossy conversion at load time.
+
+- **Mesh loading in Phase 3**: OBJ only (inline loader, no external dep). The subset handled:
+  `v x y z` vertices and `f i j k` triangles with or without `/vt/vn` suffixes. Phase 5+ will add
+  GLTF/DAE via a proper mesh library; OBJ covers most SDF collision meshes in practice.
+
+- **V-HACD version**: v4.1.0 (vcpkg port `v-hacd`). API differences from v3 that matter:
+  - Activation macro is `#define ENABLE_VHACD_IMPLEMENTATION 1` (not `VHACD_IMPLEMENTATION`).
+  - `Parameters` fields: `m_maxConvexHulls`, `m_resolution`, `m_maxNumVerticesPerCH`,
+    `m_minimumVolumePercentErrorAllowed` (double). The v3 fields `m_concavity` and `m_minVolumePerCH`
+    do not exist.
+  - `ConvexHull::m_points` is `std::vector<VHACD::Vertex>` with `.mX/.mY/.mZ` members; the v3
+    flat float pointer `m_points[i*3+k]` and `m_nPoints` count do not exist.
+  - Multi-hull support: V-HACD may return N > 1 hulls per mesh. Phase 3 uses only the first hull
+    as representative shape (stored in `ConvexHullStore`). Full multi-hull support (one body per hull
+    or a compound-shape type) is deferred to Phase 4.
+
+- **Shape catalog design**: `ShapeParams::ext_id` indexes into either `ConvexHullStore` (for
+  `ShapeType::ConvexHull`) or `MeshBvhStore` (for `ShapeType::TriangleMesh`). Both stores use flat
+  concatenated SoA arrays with per-entry start+count offsets, uploaded once after scene load.
+
+- **GJK + EPA (device-callable, Phase 3 narrowphase)**:
+  - Simplex convention: `v[0]` is the most-recently-added support point.
+  - Support function (`hull_support_world`): transforms query direction to body-local frame via R^T,
+    finds farthest vertex by linear scan (O(n) per GJK iteration), transforms result back to world.
+  - EPA polytope limits: 64 vertices, 128 faces, 32 iterations max. All fixed-size to avoid
+    dynamic allocation in device code.
+  - EPA horizon edge extraction: shared-edge cancellation via sorted edge pairs (no hash map).
+  - Entry point `gjk_epa()` returns contact normal, penetration depth, and world-space contact point.
+
+- **BVH design (static mesh, CPU build → GPU upload)**:
+  - Node layout: `BvhNode { float min_x,…,max_z; int32_t left, right, tri_idx, _pad; }`.
+    Leaf: `left < 0`, `tri_idx` valid. Internal: `left`/`right` are child indices.
+  - Build strategy: median-split on longest AABB axis using `std::nth_element` on triangle centroids.
+    O(n log n) worst case; sufficient for Phase 3 static geometry.
+  - GPU traversal uses a fixed-size stack of 64 entries (no dynamic allocation). Exceeding 64 levels
+    silently misses contacts; this depth is unreachable for meshes that fit in the BVH node budget.
+  - `MeshBvhStore` merges per-mesh BVH node arrays into a single flat buffer; child indices are
+    offset by the mesh's `node_off` at `add()` time so traversal needs only the flat array + per-mesh
+    root index.
+
+- **Narrowphase dispatch additions (Phase 3)**:
+  - TriangleMesh is always swapped to body B so traversal logic has one direction only.
+  - `Sphere` vs `TriangleMesh`: sphere-center → closest-point-on-triangle, contact if within radius.
+  - `Box` vs `TriangleMesh`: 13-axis SAT (3 box face normals + 1 triangle normal + 9 edge-cross-edge).
+  - `ConvexHull` vs `ConvexHull`: GJK → EPA pipeline above.
+  - Primitive vs primitive paths unchanged from Phase 1.
+
+- **`sdf_loader` single-pass design**: each SDF link becomes exactly one `BodyDesc`; joint anchors
+  are resolved in the parent link's frame via `SemanticPose().Resolve(joint_pose, parent_full)`.
+  Models are processed world-first (if a `<world>` element exists) or as a standalone `<model>`.
+
 **Exit criterion**: furnished room from an SDF world, mobile manipulator navigating and pushing objects, realtime.
 
 ### Phase 4 — Performance, Multi-GPU, Realtime Guarantees
@@ -296,9 +352,15 @@ Each phase has a binary go/no-go test. CI must pass all gates from prior phases 
 - Determinism gate covers a 20-frame articulation trace (hash checked in CI).
 - URDF loading is Phase 3; the Phase 2 gate uses the hardcoded robot.
 
-**Phase 3+ gates**
-- Scene-load round-trip: SDF in → simulation state → comparable to Gazebo's load of the same world for a defined comparison metric.
+**Phase 3 gates**
+- `dyphur_scene` builds with `DYPHUR_SCENE_ENABLED` when libsdformat + V-HACD are present; builds to a stub otherwise.
+- `test_scene_smoke` passes: scene module links, `VertexBuffer` round-trip, V-HACD tetrahedron → ≥1 hull with non-empty vertex arrays.
+- `examples/sdf_scene` loads `box_room.sdf` (static floor + 2 dynamic boxes), simulates 240 frames, emits metrics JSON + determinism hash. Runs headless, exits 0.
+- Narrowphase handles all four combinations present in `box_room.sdf` (Box-vs-Box, Box-vs-TriangleMesh) without crash or NaN in the hash.
+
+**Phase 4+ gates**
 - Multi-GPU gate (Phase 4): same scene single-GPU vs two-GPU produces results within floating-point tolerance (cross-device determinism is not required).
+- Phase 3+ scene-load round-trip: SDF in → simulation state → comparable to Gazebo's load of the same world for a defined comparison metric.
 
 **End-to-end smoke test (every phase) — fully headless, scripted, exits non-zero on any failure**
 - Build clean from scratch (`cmake --workflow --preset=ci-linux-cuda` or equivalent).

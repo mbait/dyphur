@@ -7,6 +7,8 @@ add_library(dyphur_core STATIC
     src/narrowphase.cpp
     src/xpbd_solver.cpp
     src/articulation.cpp
+    src/convex_hull_store.cpp
+    src/mesh_bvh.cpp
 )
 add_library(dyphur::core ALIAS dyphur_core)
 add_sycl_to_target(TARGET dyphur_core SOURCES
@@ -18,6 +20,8 @@ add_sycl_to_target(TARGET dyphur_core SOURCES
     src/narrowphase.cpp
     src/xpbd_solver.cpp
     src/articulation.cpp
+    src/convex_hull_store.cpp
+    src/mesh_bvh.cpp
 )
 
 target_include_directories(dyphur_core PUBLIC

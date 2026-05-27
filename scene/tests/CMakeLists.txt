@@ -1,4 +1,4 @@
-add_executable(test_scene_smoke smoke_test.cpp)
+add_executable(test_scene_smoke smoke_test.cpp sdf_loader_test.cpp)
 target_link_libraries(test_scene_smoke PRIVATE
     dyphur::scene
     Catch2::Catch2WithMain

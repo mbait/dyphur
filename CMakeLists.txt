@@ -32,3 +32,32 @@ add_subdirectory(core)
 add_subdirectory(scene)
 add_subdirectory(examples)
 # add_subdirectory(bindings/python)  # enabled when nanobind module is implemented
+
+# ── Install / package export ──────────────────────────────────────────────────
+include(CMakePackageConfigHelpers)
+
+install(TARGETS dyphur_compute
+        EXPORT dyphurTargets)
+
+install(EXPORT dyphurTargets
+        FILE dyphurTargets.cmake
+        NAMESPACE dyphur::
+        DESTINATION lib/cmake/dyphur)
+
+configure_package_config_file(
+    cmake/dyphurConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/dyphurConfig.cmake"
+    INSTALL_DESTINATION lib/cmake/dyphur
+)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/dyphurConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/dyphurConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/dyphurConfigVersion.cmake"
+    DESTINATION lib/cmake/dyphur
+)

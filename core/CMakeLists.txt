@@ -28,7 +28,16 @@ add_sycl_to_target(TARGET dyphur_core SOURCES
 
 target_include_directories(dyphur_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
 )
+
+install(TARGETS dyphur_core
+        EXPORT dyphurTargets
+        ARCHIVE DESTINATION lib)
+
+install(DIRECTORY include/
+        DESTINATION include
+        FILES_MATCHING PATTERN "*.hpp")
 
 target_link_libraries(dyphur_core PUBLIC
     dyphur::compute

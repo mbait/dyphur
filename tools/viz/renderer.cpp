@@ -19,9 +19,7 @@ Renderer::Renderer()
     GL::Renderer::enable(GL::Renderer::Feature::DepthTest);
     GL::Renderer::enable(GL::Renderer::Feature::FaceCulling);
 
-    // Directional light from upper-right in camera space (w=0 → directional).
-    _shader.setLightPositions({{5.f, 5.f, 5.f}})
-           .setAmbientColor(0x333333_rgbf)
+    _shader.setAmbientColor(0x333333_rgbf)
            .setSpecularColor(0xffffff_rgbf)
            .setShininess(60.f);
 }
@@ -32,6 +30,10 @@ void Renderer::setViewProjection(const Matrix4& view, const Matrix4& proj) {
 }
 
 void Renderer::draw(const SceneFileDesc& scene, const std::vector<BodyPose>& poses) {
+    // Light position in camera space (Phong shader expects camera-space positions).
+    Vector3 light_cam = (_view * Vector4{10.f, 20.f, 10.f, 1.f}).xyz();
+    _shader.setLightPositions({{light_cam}});
+
     for (uint32_t i = 0; i < static_cast<uint32_t>(poses.size()); ++i) {
         const auto& p = poses[i];
         uint32_t si = scene.body_shape_idx[i];

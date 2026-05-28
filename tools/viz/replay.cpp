@@ -151,7 +151,7 @@ private:
         float cx = _distance * std::cos(_elevation) * std::sin(_azimuth);
         float cy = _distance * std::sin(_elevation);
         float cz = _distance * std::cos(_elevation) * std::cos(_azimuth);
-        Matrix4 view = Matrix4::lookAt({cx, cy, cz}, {0.f, 0.f, 0.f}, {0.f, 1.f, 0.f});
+        Matrix4 view = Matrix4::lookAt({cx, cy, cz}, {0.f, 0.f, 0.f}, {0.f, 1.f, 0.f}).invertedRigid();
 
         auto sz = GL::defaultFramebuffer.viewport().size();
         float aspect = sz.x() > 0 && sz.y() > 0
@@ -183,7 +183,7 @@ int run_replay(int argc, char** argv) {
     float fps  = 30.f;
     bool  loop = false;
 
-    for (int i = 0; i < argc; ++i) {
+    for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--fps") == 0 && i + 1 < argc)
             fps = std::atof(argv[++i]);
         else if (std::strcmp(argv[i], "--loop") == 0)

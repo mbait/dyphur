@@ -4,6 +4,8 @@
 #include <Magnum/GL/Renderbuffer.h>
 #include <Magnum/GL/RenderbufferFormat.h>
 #include <Magnum/GL/Renderer.h>
+#include <Magnum/GL/Texture.h>
+#include <Magnum/GL/TextureFormat.h>
 #include <Magnum/Image.h>
 #include <Magnum/ImageView.h>
 #include <Magnum/Math/Matrix4.h>
@@ -78,24 +80,35 @@ public:
             poses[i] = {row[0], row[1], row[2], row[3], row[4], row[5], row[6]};
         }
 
-        // Offscreen framebuffer.
-        GL::Renderbuffer color_rb, depth_rb;
-        color_rb.setStorage(GL::RenderbufferFormat::RGBA8, {_width, _height});
+        // Offscreen framebuffer: texture for color (read via fb.read), renderbuffer for depth.
+        GL::Texture2D color_tex;
+        color_tex.setStorage(1, GL::TextureFormat::RGBA8, {_width, _height});
+        GL::Renderbuffer depth_rb;
         depth_rb.setStorage(GL::RenderbufferFormat::Depth24Stencil8, {_width, _height});
 
         GL::Framebuffer fb{Range2Di{{}, {_width, _height}}};
-        fb.attachRenderbuffer(GL::Framebuffer::ColorAttachment{0}, color_rb);
+        fb.attachTexture(GL::Framebuffer::ColorAttachment{0}, color_tex, 0);
         fb.attachRenderbuffer(GL::Framebuffer::BufferAttachment::DepthStencil, depth_rb);
-        fb.bind();
 
+        {
+            auto status = fb.checkStatus(GL::FramebufferTarget::Draw);
+            if (status != GL::Framebuffer::Status::Complete) {
+                std::fprintf(stderr, "snapshot: FBO incomplete: %d\n", int(status));
+                return 1;
+            }
+        }
+
+        fb.bind();
         GL::Renderer::setClearColor(0x222222_rgbf);
         fb.clear(GL::FramebufferClear::Color | GL::FramebufferClear::Depth);
 
         const float aspect = float(_width) / float(_height);
         Matrix4 proj = Matrix4::perspectiveProjection(55.0_degf, aspect, 0.1f, 200.f);
-        Matrix4 view = Matrix4::lookAt({8.f, 8.f, 12.f}, {0.f, 2.f, 0.f}, {0.f, 1.f, 0.f});
+        // Magnum lookAt returns camera-to-world; invert to get world-to-camera (view matrix).
+        Matrix4 view = Matrix4::lookAt({8.f, 8.f, 12.f}, {0.f, 2.f, 0.f}, {0.f, 1.f, 0.f}).invertedRigid();
 
         Renderer renderer;
+        fb.bind(); // re-bind after Renderer ctor (shader/mesh compile may disturb GL state)
         renderer.setViewProjection(view, proj);
         renderer.draw(scene, poses);
 
@@ -103,7 +116,7 @@ public:
         fb.read(fb.viewport(), image);
 
         Corrade::PluginManager::Manager<Trade::AbstractImageConverter> manager;
-        auto converter = manager.loadAndInstantiate("StbImageConverter");
+        auto converter = manager.loadAndInstantiate("StbPngImageConverter");
         if (!converter) {
             std::fprintf(stderr, "snapshot: cannot load StbImageConverter\n");
             return 1;
@@ -132,7 +145,7 @@ int run_snapshot(int argc, char** argv) {
     int width  = 1280;
     int height = 720;
 
-    for (int i = 0; i < argc; ++i) {
+    for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--frame") == 0 && i + 1 < argc)
             frame_idx = std::atoi(argv[++i]);
         else if ((std::strcmp(argv[i], "-o") == 0 ||

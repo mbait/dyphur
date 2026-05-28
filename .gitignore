@@ -52,4 +52,9 @@ Thumbs.db
 # Headless simulation artifacts
 *.trajectory
 *.metrics.json
+*.scene
+*.golden
 artifacts/
+
+# Generated snapshots / plots
+*.png

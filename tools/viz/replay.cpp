@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -65,7 +66,7 @@ private:
             exit(1);
         }
 
-        std::printf("replay: %zu bodies, %zu frames, %.1f fps playback\n",
+        std::printf("replay: %u bodies, %zu frames, %.1f fps playback\n",
                     _scene.n_bodies, _frames.size(), 1.f / _frame_dt);
 
         _renderer = std::make_unique<Renderer>();
@@ -109,8 +110,10 @@ private:
     }
 
     void mousePressEvent(MouseEvent& e) override {
-        if (e.button() == MouseEvent::Button::Left)
-            _last_mouse = {e.position().x(), e.position().y()};
+        if (e.button() == MouseEvent::Button::Left) {
+            _last_mouse[0] = e.position().x();
+            _last_mouse[1] = e.position().y();
+        }
         e.setAccepted();
     }
 
@@ -119,7 +122,8 @@ private:
         auto pos = e.position();
         float dx = float(pos.x() - _last_mouse[0]);
         float dy = float(pos.y() - _last_mouse[1]);
-        _last_mouse = {pos.x(), pos.y()};
+        _last_mouse[0] = pos.x();
+        _last_mouse[1] = pos.y();
         _azimuth   -= dx * 0.005f;
         _elevation += dy * 0.005f;
         _elevation  = Math::clamp(_elevation, -1.5f, 1.5f);

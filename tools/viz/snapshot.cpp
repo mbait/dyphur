@@ -4,6 +4,7 @@
 #include <Magnum/GL/Renderbuffer.h>
 #include <Magnum/GL/RenderbufferFormat.h>
 #include <Magnum/GL/Renderer.h>
+#include <Magnum/Image.h>
 #include <Magnum/ImageView.h>
 #include <Magnum/Math/Matrix4.h>
 #include <Magnum/PixelFormat.h>
@@ -38,9 +39,9 @@ public:
 
     int result() const { return _result; }
 
-private:
-    void drawEvent() override {
+    int exec() override {
         _result = render();
+        return _result;
     }
 
     int render() {
@@ -98,7 +99,8 @@ private:
         renderer.setViewProjection(view, proj);
         renderer.draw(scene, poses);
 
-        Image2D image = fb.read(fb.viewport(), PixelFormat::RGBA8Unorm);
+        Image2D image{PixelFormat::RGBA8Unorm};
+        fb.read(fb.viewport(), image);
 
         Corrade::PluginManager::Manager<Trade::AbstractImageConverter> manager;
         auto converter = manager.loadAndInstantiate("StbImageConverter");
@@ -106,8 +108,7 @@ private:
             std::fprintf(stderr, "snapshot: cannot load StbImageConverter\n");
             return 1;
         }
-        // API note: Magnum 2020.06 uses convertToFile; older releases used exportToFile.
-        if (!converter->convertToFile(image, _outfile)) {
+        if (!converter->exportToFile(image, _outfile)) {
             std::fprintf(stderr, "snapshot: cannot write %s\n", _outfile.c_str());
             return 1;
         }

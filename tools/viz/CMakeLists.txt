@@ -2,6 +2,11 @@ if(DYPHUR_SKIP_VIZ)
     return()
 endif()
 
+# Magnum's FindMagnum.cmake calls find_package(EGL) but CMake 3.28 has no
+# built-in FindEGL.cmake. Provide ours before Magnum searches for components.
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+find_package(EGL REQUIRED)
+
 find_package(Magnum QUIET COMPONENTS
     GL MeshTools Primitives Shaders Trade
     GlfwApplication WindowlessEglApplication)

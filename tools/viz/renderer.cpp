@@ -20,7 +20,7 @@ Renderer::Renderer()
     GL::Renderer::enable(GL::Renderer::Feature::FaceCulling);
 
     // Directional light from upper-right in camera space (w=0 → directional).
-    _shader.setLightPositions({{5.f, 5.f, 5.f, 0.f}})
+    _shader.setLightPositions({{5.f, 5.f, 5.f}})
            .setAmbientColor(0x333333_rgbf)
            .setSpecularColor(0xffffff_rgbf)
            .setShininess(60.f);

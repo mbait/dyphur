@@ -12,6 +12,7 @@
 #include <scene/sdf_loader.hpp>
 #include <core/body_store.hpp>
 #include <core/shape_store.hpp>
+#include "../common/scene_io.hpp"
 #include <core/convex_hull_store.hpp>
 #include <core/mesh_bvh.hpp>
 #include <core/broadphase.hpp>
@@ -27,6 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <vector>
 
@@ -137,11 +139,50 @@ int main(int argc, char** argv)
     MeshBvhCatalogView mv = ms.view();
 
 
+    // ── Scene descriptor ─────────────────────────────────────────────────────
+    {
+        std::vector<uint32_t> body_shape_idx(N);
+        std::vector<ShapeParams> shape_params(N);
+        for (uint32_t i = 0; i < N; ++i) {
+            body_shape_idx[i] = scene.bodies[i].body.shape_handle;
+            shape_params[i]   = scene.bodies[i].shape;
+        }
+        write_scene("sdf_arm_push", N, body_shape_idx.data(), shape_params.data(), N);
+    }
+
     // ── Bodies ────────────────────────────────────────────────────────────────
     BodyStore bs(s, N);
     for (const auto& bd : scene.bodies) bs.add(bd.body);
     bs.upload(); s.wait();
     BodyView bv = bs.view();
+
+    // ── Trajectory file ───────────────────────────────────────────────────────
+    std::vector<float> hx_t(N), hy_t(N), hz_t(N);
+    std::vector<float> hw_t(N), hqx_t(N), hqy_t(N), hqz_t(N);
+
+    std::ofstream traj("sdf_arm_push.trajectory", std::ios::binary);
+    {
+        uint32_t hdr[2] = {N, static_cast<uint32_t>(n_frames)};
+        traj.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+    }
+
+    auto download_traj = [&]() {
+        q.memcpy(hx_t.data(),  bv.pos_x, N * sizeof(float));
+        q.memcpy(hy_t.data(),  bv.pos_y, N * sizeof(float));
+        q.memcpy(hz_t.data(),  bv.pos_z, N * sizeof(float));
+        q.memcpy(hw_t.data(),  bv.rot_w, N * sizeof(float));
+        q.memcpy(hqx_t.data(), bv.rot_x, N * sizeof(float));
+        q.memcpy(hqy_t.data(), bv.rot_y, N * sizeof(float));
+        q.memcpy(hqz_t.data(), bv.rot_z, N * sizeof(float)).wait();
+    };
+
+    auto write_traj_frame = [&]() {
+        for (uint32_t i = 0; i < N; ++i) {
+            float row[7] = {hx_t[i], hy_t[i], hz_t[i],
+                            hw_t[i], hqx_t[i], hqy_t[i], hqz_t[i]};
+            traj.write(reinterpret_cast<const char*>(row), sizeof(row));
+        }
+    };
 
     // ── Joints ────────────────────────────────────────────────────────────────
     const uint32_t NJ = static_cast<uint32_t>(scene.joints.size());
@@ -186,8 +227,14 @@ int main(int argc, char** argv)
         np.run(s, bp.pairs_ptr(), np_, bv, sv, hv, mv);  // always resets contact store
         solver.solve(s, np.contacts(), jv, bv, ip.dt);
 
+        if (f % 2 == 0) {
+            download_traj();
+            write_traj_frame();
+        }
+
         sim_t += ip.dt;
     }
+    traj.close();
     s.wait();  // single end-of-batch sync for timing
 
     auto t1 = std::chrono::steady_clock::now();

@@ -34,6 +34,8 @@ add_subdirectory(scene)
 add_subdirectory(examples)
 add_subdirectory(bindings/python)
 
+add_subdirectory(tools/viz)
+
 # ── Install / package export ──────────────────────────────────────────────────
 include(CMakePackageConfigHelpers)
 

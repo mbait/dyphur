@@ -15,6 +15,25 @@
     },
     "tracy",
     "sdformat",
-    "v-hacd"
+    "v-hacd",
+    {
+      "name": "magnum",
+      "default-features": false,
+      "features": [
+        "eglcontext",
+        "glfwapplication",
+        "windowlesseglapplication",
+        "primitives",
+        "shaders",
+        "anyimageconverter",
+        "tgaimageconverter",
+        "meshtools"
+      ]
+    },
+    {
+      "name": "magnum-plugins",
+      "default-features": false,
+      "features": ["stbimageconverter"]
+    }
   ]
 }

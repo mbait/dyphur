@@ -15,6 +15,7 @@
 #include <core/xpbd_solver.hpp>
 #include <core/articulation.hpp>
 #include <compute/device.hpp>
+#include "../common/scene_io.hpp"
 #include <spdlog/spdlog.h>
 #include <fmt/format.h>
 #include <chrono>
@@ -85,6 +86,15 @@ int main(int argc, char** argv) {
     uint32_t gnd_shape = ss.add(gnd_sp);
 
     ss.upload();
+
+    // ── Scene descriptor ──────────────────────────────────────────────────────
+    {
+        std::vector<uint32_t> body_scene_idx(N_BODIES);
+        std::fill(body_scene_idx.begin(), body_scene_idx.begin() + N_DYN, dyn_shape);
+        body_scene_idx[N_DYN] = gnd_shape;
+        ShapeParams scene_shapes[] = {dyn_sp, gnd_sp};
+        write_scene(prefix, N_BODIES, body_scene_idx.data(), scene_shapes, 2);
+    }
 
     // ── Bodies ────────────────────────────────────────────────────────────────
     BodyStore bs(s, N_BODIES);

@@ -18,6 +18,7 @@
 #include <core/joint_store.hpp>
 #include <core/xpbd_solver.hpp>
 #include <compute/device.hpp>
+#include "../common/scene_io.hpp"
 #include <spdlog/spdlog.h>
 #include <fmt/format.h>
 #include <chrono>
@@ -184,6 +185,19 @@ int main(int argc, char** argv) {
 
     bs.upload();
     s.wait();
+
+    // ── Scene descriptor ──────────────────────────────────────────────────────
+    {
+        ShapeParams shapes[2];
+        shapes[0].type   = ShapeType::Box;
+        shapes[0].half_x = LK_HX; shapes[0].half_y = LK_HY; shapes[0].half_z = LK_HZ;
+        shapes[1].type   = ShapeType::Box;
+        shapes[1].half_x = BLOCK_HALF; shapes[1].half_y = BLOCK_HALF; shapes[1].half_z = BLOCK_HALF;
+        uint32_t idx[N_BODIES];
+        for (int i = 0; i < N_BODIES - 1; ++i) idx[i] = 0;
+        idx[N_BODIES - 1] = 1;
+        write_scene(prefix, N_BODIES, idx, shapes, 2);
+    }
 
     // ── Joints ────────────────────────────────────────────────────────────────
     //

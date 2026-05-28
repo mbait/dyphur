@@ -1,18 +1,58 @@
-# tools/viz — Standalone Trajectory Viewer
+# tools/viz — Trajectory Visualiser
 
-This is the **only** part of the project intended for manual human use. It is **not** part of the engine, **not** on the CI path, and **not** required for any automated check.
+Standalone executable for visualising dyphur trajectory dumps.  Not on the CI
+path; built only when Magnum is found in vcpkg.
 
-## Purpose
+## Modes
 
-Read a `.trajectory` dump produced by a headless dyphur example (e.g. `examples/stress_test_blocks`) and replay it visually so a human can sanity-check what happened.
+```
+viz replay   <prefix> [--fps N] [--loop]
+viz snapshot <prefix> [--frame N] [-o out.png] [--width W] [--height H]
+viz live     <prefix.scene>          (not yet implemented)
+```
 
-## Status
+### replay — interactive trajectory playback
 
-Not yet implemented. Planned as a Python script using one of:
+Opens a GLFW window.  Reads `<prefix>.trajectory` and `<prefix>.scene`.
 
-- [`rerun.io`](https://rerun.io) — Apache-2, modern, robotics-friendly, separate viewer GUI
-- [`meshcat`](https://github.com/meshcat-dev/meshcat) — minimal browser-based viewer, common in robotics
+Controls:
+- Space — pause / unpause
+- ← → arrow keys — step one frame (pauses automatically)
+- Left-drag — orbit camera
+- Scroll — zoom in / out
+- Q / Escape — quit
 
-## Why it's separate
+### snapshot — headless PNG output
 
-The engine itself is headless-first. All correctness and performance claims are backed by automated tests / benchmarks / golden-hash regressions. Visualization is for human comprehension only, never for validation. Keeping the viewer out of the build avoids dragging GUI / display dependencies onto headless CI machines.
+EGL offscreen rendering (no display required).  Renders one trajectory frame
+and writes a PNG.  Useful for whitepaper figures.
+
+```
+viz snapshot stress_test_blocks --frame 0 -o frame0.png
+```
+
+Default output size: 1280×720.
+
+### live — real-time visualisation (not yet implemented)
+
+Will read poses from a POSIX shared-memory ring buffer written by a running
+simulation via `dyphur::VizSink`.
+
+## Build
+
+vcpkg installs Magnum automatically when you run cmake.  Build with any preset:
+
+```
+cmake --preset=omp
+cmake --build build/omp --target viz
+```
+
+If Magnum is unavailable, cmake prints a warning and skips `tools/viz`.
+Pass `-DDYPHUR_SKIP_VIZ=ON` to suppress even that.
+
+## Output files
+
+Each demo writes `<prefix>.trajectory` and `<prefix>.scene` alongside the
+existing `.metrics.json` and `.golden` outputs.  The `.scene` file maps each
+body index to a shape (type + half-extents) so the visualiser can render the
+correct geometry.

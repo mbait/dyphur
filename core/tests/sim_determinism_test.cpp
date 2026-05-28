@@ -202,10 +202,20 @@ static uint64_t run_artic_sim(Device& dev) {
 // the physics pipeline that alters the trajectory will fail this test.
 // To re-derive: run the test binary and read the INFO line on failure (or
 // temporarily set GOLDEN = 0 to skip the equality check and print the hash).
-TEST_CASE("sim determinism: 8 boxes + ground, 20 frames", "[determinism]") {
-    // CPU (OMP) golden — must be re-derived if physics logic changes.
-    constexpr uint64_t GOLDEN = 0xcbcd209c3665c818ULL;
+// Per-backend goldens: each build toolchain may produce different FP results
+// on the CPU path due to differing optimisation flags (CUDA vs OMP clang).
+// Re-derive by running with GOLDEN=0 and reading the INFO line on failure.
+#if defined(DYPHUR_BACKEND_IS_CUDA)
+// CUDA build (CPU path compiled by CUDA-capable clang)
+constexpr uint64_t GOLDEN_BOX   = 0xfb43a5a0352e1fe8ULL;
+constexpr uint64_t GOLDEN_ARTIC = 0x751ebe6959a2507cULL;
+#else
+// OMP / CPU-only build
+constexpr uint64_t GOLDEN_BOX   = 0xcbcd209c3665c818ULL;
+constexpr uint64_t GOLDEN_ARTIC = 0x44d086af21f338cfULL;
+#endif
 
+TEST_CASE("sim determinism: 8 boxes + ground, 20 frames", "[determinism]") {
     Device dev = Device::default_cpu();
 
     uint64_t h1 = run_sim(dev);
@@ -214,17 +224,13 @@ TEST_CASE("sim determinism: 8 boxes + ground, 20 frames", "[determinism]") {
     // Run-to-run consistency is the core guarantee.
     REQUIRE(h1 == h2);
 
-    // Golden check — skipped while GOLDEN is placeholder zero.
-    if (GOLDEN != 0) {
-        INFO("hash=0x" << std::hex << h1 << " golden=0x" << GOLDEN);
-        REQUIRE(h1 == GOLDEN);
+    if (GOLDEN_BOX != 0) {
+        INFO("hash=0x" << std::hex << h1 << " golden=0x" << GOLDEN_BOX);
+        REQUIRE(h1 == GOLDEN_BOX);
     }
 }
 
 TEST_CASE("sim determinism: 2-link articulated arm, 20 frames", "[determinism]") {
-    // CPU (OMP) golden — must be re-derived if physics logic changes.
-    constexpr uint64_t GOLDEN = 0x44d086af21f338cfULL;
-
     Device dev = Device::default_cpu();
 
     uint64_t h1 = run_artic_sim(dev);
@@ -233,8 +239,8 @@ TEST_CASE("sim determinism: 2-link articulated arm, 20 frames", "[determinism]")
     INFO("artic hash=0x" << std::hex << h1);
     REQUIRE(h1 == h2);
 
-    if (GOLDEN != 0) {
-        INFO("hash=0x" << std::hex << h1 << " golden=0x" << GOLDEN);
-        REQUIRE(h1 == GOLDEN);
+    if (GOLDEN_ARTIC != 0) {
+        INFO("hash=0x" << std::hex << h1 << " golden=0x" << GOLDEN_ARTIC);
+        REQUIRE(h1 == GOLDEN_ARTIC);
     }
 }

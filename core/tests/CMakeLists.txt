@@ -75,6 +75,11 @@ target_link_libraries(test_core_sim_determinism PRIVATE
     dyphur::core
     Catch2::Catch2WithMain
 )
+if(DYPHUR_BACKEND STREQUAL "CUDA")
+    target_compile_definitions(test_core_sim_determinism PRIVATE DYPHUR_BACKEND_IS_CUDA=1)
+elseif(DYPHUR_BACKEND STREQUAL "HIP")
+    target_compile_definitions(test_core_sim_determinism PRIVATE DYPHUR_BACKEND_IS_HIP=1)
+endif()
 add_sycl_to_target(TARGET test_core_sim_determinism SOURCES sim_determinism_test.cpp)
 dyphur_add_determinism_test(test_core_sim_determinism)
 

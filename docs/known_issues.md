@@ -7,7 +7,11 @@ contains enough information to implement the fix without re-investigation.
 
 ## Issue 1 — `test_core_math_equiv` fails on CUDA backend
 
-**Status**: failing on every run (deterministic, not flaky)
+**Status**: ✅ **RESOLVED** (2026-05-28) — bit-exact checks replaced with `WithinULP(1)` at `core/tests/math_equiv_test.cpp:67–72, 116–121`. OMP passes; CUDA 1-ULP FMA behaviour is now within tolerance.
+
+_(Original analysis preserved below for reference.)_
+
+**Original status**: failing on every run (deterministic, not flaky)
 **Affected test**: `test_core_math_equiv` (label `smoke`)
 **Affected preset**: `cuda` (GPU backend); `omp` passes
 
@@ -111,7 +115,7 @@ operations that are "correct to last-place" on either path.
 
 ## Issue 2 — 1025-body stress test runs at 51 fps (0.86× realtime)
 
-**Status**: measured on RTX 3060, Release build, `cuda` preset
+**Status**: Issues 2b and 2c resolved (2026-05-28). Issue 2a partially resolved. Measured on RTX 3060, Release build, `cuda` preset.
 **Target**: v0.1 demo goal is ≥ realtime (≥60 fps) for 1025 bodies
 **Current**: `stress_test_blocks` with 1025 bodies, 600 frames → **51 fps**
 
@@ -119,7 +123,11 @@ Three independent sub-causes, each fixable in isolation.
 
 ---
 
-### Issue 2a — Broadphase pair sort dominates GPU time (77%)
+### Issue 2a — Broadphase pair sort dominates GPU time (77%) — partially resolved
+
+**Resolution (2026-05-28)**: For n ≤ 1024 (covers all practical pair counts for ≤ ~1000 bodies), `sort_by_key` now uses a single work-group kernel with local memory — all O(log²n) bitonic passes execute in one kernel launch. For n > 1024 it falls back to the original multi-launch bitonic. `compute/include/compute/sort.hpp` updated.
+
+_(Original analysis preserved below.)_
 
 **Stage profiling on 512 bodies** (from `test_core_bench`, CUDA):
 
@@ -187,7 +195,11 @@ frame time).
 
 ---
 
-### Issue 2b — BVH refit kernel is sequential
+### Issue 2b — BVH refit kernel is sequential — RESOLVED
+
+**Resolution (2026-05-28)**: The `parallel_for(s, 1u, ...)` sequential loop in `core/src/broadphase.cpp` (Step 6) was replaced with `parallel_for(s, n_int, ...)`. Each leaf gets its own work-item; Karras atomic-flag synchronisation (`atomic_add_seq`) remains intact. The `d_flags_` buffer is already zero-initialised at Step 3 before the refit runs.
+
+_(Original analysis preserved below.)_
 
 **Root cause**: the LBVH refit (bottom-up AABB propagation) is
 submitted as a single work-item loop:
@@ -247,7 +259,11 @@ but now fully parallel.
 
 ---
 
-### Issue 2c — Extra blocking GPU sync per frame in `stress_test_blocks`
+### Issue 2c — Extra blocking GPU sync per frame in `stress_test_blocks` — RESOLVED
+
+**Resolution (2026-05-28)**: `np.download_count(s)` removed from the hot loop in `examples/stress_test_blocks/main.cpp`. One `download_count` call remains after the loop to approximate the average contact count using the last frame's value.
+
+_(Original analysis preserved below.)_
 
 **Root cause**: `stress_test_blocks/main.cpp` calls `np.download_count(s)`
 in the hot loop to accumulate `total_contacts` for the metrics JSON:
@@ -322,11 +338,10 @@ the OMP Debug build.
 
 | ID  | Issue                                              | File(s)                                          | Effort | Impact      |
 |-----|----------------------------------------------------|--------------------------------------------------|--------|-------------|
-| 1   | `test_core_math_equiv` 1-ULP CUDA failure (FMA)    | `core/tests/math_equiv_test.cpp:67–72, 116–121` | XS     | Test passes |
-| 2a  | Bitonic sort: O(log²n) kernel launches (77% time)  | `compute/include/compute/sort.hpp`               | M      | ~3× fps     |
-| 2b  | Sequential BVH refit (`parallel_for(1u, ...)`)     | `core/src/broadphase.cpp:217`                    | S      | ~1.5× fps   |
-| 2c  | Extra `np.download_count` sync per frame           | `examples/stress_test_blocks/main.cpp:191`       | XS     | ~8% fps     |
+| 1   | ~~`test_core_math_equiv` 1-ULP CUDA failure (FMA)~~    | resolved 2026-05-28                          | —      | ✅ resolved |
+| 2a  | Bitonic sort: O(log²n) kernel launches (n > 1024)  | `compute/include/compute/sort.hpp`               | M      | ~3× fps (n>1024 only) |
+| 2b  | ~~Sequential BVH refit~~                           | resolved 2026-05-28                              | —      | ✅ resolved |
+| 2c  | ~~Extra `np.download_count` sync per frame~~        | resolved 2026-05-28                              | —      | ✅ resolved |
 | 3   | ~~`test_core_articulation` SIGSEGV (Fixed/Revolute)~~  | resolved in Phase 5                          | —      | ✅ resolved  |
 
-Fix order recommendation: 1 → 2c → 3 → 2b → 2a (ascending effort, each is
-independent of the others).
+Remaining open: Issue 2a for n > 1024 pairs (requires oneDPL/CUB or a multi-pass radix sort).

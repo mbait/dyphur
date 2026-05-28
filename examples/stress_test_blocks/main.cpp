@@ -171,7 +171,6 @@ int main(int argc, char** argv) {
     };
 
     // ── Main simulation loop ──────────────────────────────────────────────────
-    uint64_t total_contacts = 0;
     auto wall_start = Clock::now();
 
     for (int frame = 0; frame < n_frames; ++frame) {
@@ -183,19 +182,20 @@ int main(int argc, char** argv) {
         solver.solve(s, np.contacts(), JointView{}, bv, DT);
 
         // Trajectory snapshot every other frame (download_state provides GPU sync).
-        // Contact count is read after the solver either way.
         if (frame % 2 == 0) {
             download_state();
             write_traj_frame();
         }
-        total_contacts += np.download_count(s);
     }
+    // Sample contact count from the last frame only — approximate, avoids a
+    // blocking sync inside the hot loop.
+    s.wait();
+    double avg_cnt = static_cast<double>(np.download_count(s));
 
     traj.close();
 
     double wall_sec = Seconds(Clock::now() - wall_start).count();
     double fps      = n_frames / wall_sec;
-    double avg_cnt  = static_cast<double>(total_contacts) / n_frames;
 
     // ── Final-state hash (determinism gate) ──────────────────────────────────
     download_state();

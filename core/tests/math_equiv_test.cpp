@@ -4,15 +4,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
-#include <cstring>
 #include <vector>
 
 using namespace dyphur;
 
-// Bit-cast float to uint32 for exact comparison.
-static uint32_t to_bits(float f) {
-    uint32_t u; std::memcpy(&u, &f, 4); return u;
-}
 
 // ── Vec3 cross product: host vs device ───────────────────────────────────────
 
@@ -66,9 +61,9 @@ TEST_CASE("Vec3: host-device cross product equivalence", "[smoke]") {
 
     for (size_t i = 0; i < n; ++i) {
         INFO("element " << i);
-        REQUIRE(to_bits(d_out_x[i]) == to_bits(h_rx[i]));
-        REQUIRE(to_bits(d_out_y[i]) == to_bits(h_ry[i]));
-        REQUIRE(to_bits(d_out_z[i]) == to_bits(h_rz[i]));
+        REQUIRE_THAT(d_out_x[i], Catch::Matchers::WithinULP(h_rx[i], 1));
+        REQUIRE_THAT(d_out_y[i], Catch::Matchers::WithinULP(h_ry[i], 1));
+        REQUIRE_THAT(d_out_z[i], Catch::Matchers::WithinULP(h_rz[i], 1));
     }
 }
 
@@ -115,8 +110,8 @@ TEST_CASE("Quat: host-device rotate equivalence", "[smoke]") {
 
     for (size_t i = 0; i < n; ++i) {
         INFO("element " << i);
-        REQUIRE(to_bits(ox[i]) == to_bits(h_rx[i]));
-        REQUIRE(to_bits(oy[i]) == to_bits(h_ry[i]));
-        REQUIRE(to_bits(oz[i]) == to_bits(h_rz[i]));
+        REQUIRE_THAT(ox[i], Catch::Matchers::WithinULP(h_rx[i], 1));
+        REQUIRE_THAT(oy[i], Catch::Matchers::WithinULP(h_ry[i], 1));
+        REQUIRE_THAT(oz[i], Catch::Matchers::WithinULP(h_rz[i], 1));
     }
 }

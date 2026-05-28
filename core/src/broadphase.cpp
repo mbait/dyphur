@@ -214,7 +214,7 @@ void Broadphase::build_and_query(Stream&         s,
         const BodyView  bv = bodies;
         const ShapeView sv = shapes;
 
-        parallel_for(s, 1u, [=](size_t) { for (size_t leaf_k = 0; leaf_k < static_cast<size_t>(n_int); ++leaf_k) {
+        parallel_for(s, static_cast<size_t>(n_int), [=](size_t leaf_k) {
             uint32_t body = d_si[leaf_k];
 
             // Compute AABB for this body's shape (fp32).
@@ -285,7 +285,7 @@ void Broadphase::build_and_query(Stream&         s,
                 d_mn_z[p] = sycl::half(pmnz);  d_mx_z[p] = sycl::half(pmxz);
                 cur = p;
             }
-        } }); // end sequential refit loop
+        }); // end parallel refit
     }
 
     // ── Step 7: Traversal — emit overlapping candidate pairs ─────────────────

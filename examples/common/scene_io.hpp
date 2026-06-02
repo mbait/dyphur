@@ -2,8 +2,11 @@
 #include <core/shapes.hpp>
 #include <cstdint>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace dyphur {
@@ -79,6 +82,40 @@ inline SceneFileDesc read_scene(const std::string& prefix) {
     }
 
     return desc;
+}
+
+// ── Mesh map sidecar ──────────────────────────────────────────────────────────
+// <prefix>.meshmap: plain text, one entry per line: "<body_idx> <path>"
+// Paths are relative to the directory of the executable that writes the file.
+// Viz tools use this to render bodies with their actual mesh geometry instead
+// of the fallback box/sphere. Absent = all bodies use shape-based rendering.
+
+inline void write_meshmap(
+    const std::string& prefix,
+    const std::vector<std::pair<uint32_t, std::string>>& entries)
+{
+    std::ofstream f(prefix + ".meshmap");
+    if (!f) throw std::runtime_error("write_meshmap: cannot open " + prefix + ".meshmap");
+    for (const auto& [idx, path] : entries)
+        f << idx << " " << path << "\n";
+}
+
+inline std::unordered_map<uint32_t, std::string>
+read_meshmap(const std::string& prefix)
+{
+    std::unordered_map<uint32_t, std::string> result;
+    std::ifstream f(prefix + ".meshmap");
+    if (!f) return result;  // absent is fine — caller falls back to box/sphere
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        uint32_t idx;
+        std::string path;
+        if (ss >> idx >> path)
+            result[idx] = path;
+    }
+    return result;
 }
 
 // Trajectory file header (simulation frame count, not trajectory frame count;

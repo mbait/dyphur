@@ -69,7 +69,8 @@ private:
         std::printf("replay: %u bodies, %zu frames, %.1f fps playback\n",
                     _scene.n_bodies, _frames.size(), 1.f / _frame_dt);
 
-        _renderer = std::make_unique<Renderer>();
+        auto meshmap = read_meshmap(_prefix);
+        _renderer = std::make_unique<Renderer>(std::move(meshmap));
         updateCamera();
     }
 

@@ -208,7 +208,7 @@ static uint64_t run_artic_sim(Device& dev) {
 #if defined(DYPHUR_BACKEND_IS_CUDA)
 // CUDA build (CPU path compiled by CUDA-capable clang)
 constexpr uint64_t GOLDEN_BOX   = 0xfb43a5a0352e1fe8ULL;
-constexpr uint64_t GOLDEN_ARTIC = 0x751ebe6959a2507cULL;
+constexpr uint64_t GOLDEN_ARTIC = 0x7c0a8166eb564f41ULL;  // updated: XPBD static friction
 #else
 // OMP / CPU-only build
 constexpr uint64_t GOLDEN_BOX   = 0xcbcd209c3665c818ULL;

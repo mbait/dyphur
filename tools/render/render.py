@@ -24,6 +24,42 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 
+# ── Binary STL loader ────────────────────────────────────────────────────────
+
+def load_stl(path):
+    """Return list of (v0, v1, v2) vertex triples (each vertex is np.array[3])."""
+    with open(path, "rb") as f:
+        f.read(80)  # header
+        n_tri = struct.unpack("<I", f.read(4))[0]
+        triangles = []
+        for _ in range(n_tri):
+            f.read(12)  # face normal (ignored; recomputed for shading)
+            verts = [np.frombuffer(f.read(12), dtype="<f4").astype(float) for _ in range(3)]
+            f.read(2)   # attribute
+            triangles.append(tuple(verts))
+    return triangles
+
+
+# ── Meshmap sidecar ────────────────────────────────────────────────────────────
+
+def read_meshmap(prefix):
+    """Return dict {body_idx: path} from <prefix>.meshmap, or {} if absent."""
+    path = prefix + ".meshmap"
+    result = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    result[int(parts[0])] = parts[1]
+    except FileNotFoundError:
+        pass
+    return result
+
+
 # ── Scene file reading ────────────────────────────────────────────────────────
 
 SHAPE_BOX          = 0
@@ -144,6 +180,37 @@ def draw_oriented_box(draw, cx, cy, cz, qw, qx, qy, qz,
         draw.line(screen + [screen[0]], fill=(40, 40, 40), width=1)
 
 
+def draw_stl_body(draw, triangles, cx, cy, cz, qw, qx, qy, qz,
+                  color, ox, oy, scale):
+    """Draw a STL triangle mesh using painter's algorithm (isometric projection)."""
+    body_parts = []
+    for (v0, v1, v2) in triangles:
+        # Rotate + translate each vertex into world space.
+        w0 = np.array([cx, cy, cz]) + quat_rotate(v0, qw, qx, qy, qz)
+        w1 = np.array([cx, cy, cz]) + quat_rotate(v1, qw, qx, qy, qz)
+        w2 = np.array([cx, cy, cz]) + quat_rotate(v2, qw, qx, qy, qz)
+        centroid = (w0 + w1 + w2) / 3.0
+        d = depth_key(centroid)
+        # Face normal for shading (world space)
+        e1 = w1 - w0
+        e2 = w2 - w0
+        n = np.cross(e1, e2)
+        nn = np.linalg.norm(n)
+        n = n / nn if nn > 1e-10 else np.array([0., 0., 1.])
+        body_parts.append((d, [w0, w1, w2], n))
+
+    body_parts.sort(key=lambda x: -x[0])  # back-to-front
+
+    for _, pts, n in body_parts:
+        dot = np.dot(n, _CAM_DIR)
+        if dot <= 0.0:
+            continue  # back-face cull
+        shade = max(0.35, min(1.0, 0.4 + 0.6 * dot / np.linalg.norm(_CAM_DIR)))
+        fill = tuple(int(c * shade) for c in color)
+        screen = [iso(p[0], p[1], p[2], ox, oy, scale) for p in pts]
+        draw.polygon(screen, fill=fill)
+
+
 def draw_sphere(draw, cx, cy, cz, radius, color, ox, oy, scale):
     # Project the top, bottom, left, right extents of the sphere into screen
     # space to get an ellipse approximation (good enough for debugging).
@@ -193,7 +260,7 @@ def height_color(y, y_min=0.0, y_max=18.0):
 
 def render_frame(frame, n_bodies, body_shape_idx, shapes,
                  title="", width=1200, height=800, scale=20.0,
-                 color_by_height=False):
+                 color_by_height=False, meshmap=None, stl_cache=None):
     img = Image.new("RGB", (width, height), (34, 34, 34))
     draw = ImageDraw.Draw(img)
 
@@ -218,6 +285,20 @@ def render_frame(frame, n_bodies, body_shape_idx, shapes,
             color = height_color(cy)
         else:
             color = body_color(i)
+
+        # If body has a mesh entry, render STL instead of shape fallback.
+        if meshmap and i in meshmap:
+            stl_path = meshmap[i]
+            if stl_cache is not None and stl_path not in stl_cache:
+                try:
+                    stl_cache[stl_path] = load_stl(stl_path)
+                except Exception:
+                    stl_cache[stl_path] = None
+            tris = stl_cache.get(stl_path) if stl_cache is not None else None
+            if tris:
+                draw_stl_body(draw, tris, cx, cy, cz, qw, qx, qy, qz,
+                              color, ox, oy, scale)
+                continue
 
         stype = sp["type"]
         if stype == SHAPE_SPHERE:
@@ -330,6 +411,9 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     name = os.path.basename(args.prefix)
 
+    meshmap = read_meshmap(args.prefix)
+    stl_cache = {}  # shared across frames to avoid reloading
+
     for fi in frame_indices:
         if fi < 0 or fi >= T:
             print(f"warning: frame {fi} out of range [0, {T-1}], skipping", file=sys.stderr)
@@ -340,6 +424,7 @@ def main():
             title=title,
             width=args.width, height=args.height, scale=args.scale,
             color_by_height=args.color_by_height,
+            meshmap=meshmap, stl_cache=stl_cache,
         )
         out = os.path.join(args.output_dir, f"{name}_f{fi:04d}.png")
         img.save(out)

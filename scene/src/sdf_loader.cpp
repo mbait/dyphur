@@ -26,6 +26,44 @@
 
 namespace dyphur {
 
+// ── Binary STL mesh loader ────────────────────────────────────────────────────
+// Format: 80-byte header, uint32 triangle count, then per-triangle:
+//   3 × float normal (ignored), 3 × (3 × float) vertex, uint16 attribute.
+static VertexBuffer load_stl(const std::string& path, float scale)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("load_stl: cannot open " + path);
+
+    f.seekg(80);  // skip header
+    uint32_t n_tri = 0;
+    f.read(reinterpret_cast<char*>(&n_tri), 4);
+
+    VertexBuffer vb;
+    vb.x.reserve(n_tri * 3);
+    vb.y.reserve(n_tri * 3);
+    vb.z.reserve(n_tri * 3);
+    vb.idx_a.reserve(n_tri);
+    vb.idx_b.reserve(n_tri);
+    vb.idx_c.reserve(n_tri);
+
+    for (uint32_t t = 0; t < n_tri; ++t) {
+        float buf[12];  // normal(3) + v0(3) + v1(3) + v2(3)
+        f.read(reinterpret_cast<char*>(buf), 48);
+        f.ignore(2);  // attribute byte count
+        uint32_t base = static_cast<uint32_t>(vb.x.size());
+        for (int v = 0; v < 3; ++v) {
+            vb.x.push_back(buf[3 + v*3 + 0] * scale);
+            vb.y.push_back(buf[3 + v*3 + 1] * scale);
+            vb.z.push_back(buf[3 + v*3 + 2] * scale);
+        }
+        vb.idx_a.push_back(base);
+        vb.idx_b.push_back(base + 1);
+        vb.idx_c.push_back(base + 2);
+    }
+    if (vb.x.empty()) throw std::runtime_error("load_stl: no triangles in " + path);
+    return vb;
+}
+
 // ── Simple OBJ mesh loader ────────────────────────────────────────────────────
 // Handles the subset used by typical robot/scene meshes:
 //   v x y z
@@ -209,8 +247,16 @@ SceneDesc load_sdf(const std::string& path, const SdfLoadParams& p)
                         float mscale = static_cast<float>(mesh->Scale().X()) * p.scale;
                         std::string mesh_path = resolve_uri(uri, sdf_dir);
 
-                        // Only OBJ supported currently
-                        VertexBuffer vb = load_obj(mesh_path, mscale);
+                        // Dispatch by extension: OBJ or binary STL
+                        VertexBuffer vb;
+                        auto ext_pos = mesh_path.rfind('.');
+                        std::string ext = (ext_pos != std::string::npos)
+                            ? mesh_path.substr(ext_pos) : "";
+                        for (auto& c : ext) c = static_cast<char>(std::tolower(c));
+                        if (ext == ".stl")
+                            vb = load_stl(mesh_path, mscale);
+                        else
+                            vb = load_obj(mesh_path, mscale);
 
                         if (is_static && p.static_mesh_as_trimesh) {
                             bd.mesh_idx = static_cast<uint32_t>(scene.meshes.size());

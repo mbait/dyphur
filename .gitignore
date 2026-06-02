@@ -54,7 +54,9 @@ Thumbs.db
 *.metrics.json
 *.scene
 *.golden
+*.meshmap
 artifacts/
 
 # Generated snapshots / plots
 *.png
+!examples/**/assets/**/*.png

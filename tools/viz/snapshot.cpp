@@ -107,7 +107,8 @@ public:
         // Magnum lookAt returns camera-to-world; invert to get world-to-camera (view matrix).
         Matrix4 view = Matrix4::lookAt({8.f, 8.f, 12.f}, {0.f, 2.f, 0.f}, {0.f, 1.f, 0.f}).invertedRigid();
 
-        Renderer renderer;
+        auto meshmap = read_meshmap(_prefix);
+        Renderer renderer{std::move(meshmap)};
         fb.bind(); // re-bind after Renderer ctor (shader/mesh compile may disturb GL state)
         renderer.setViewProjection(view, proj);
         renderer.draw(scene, poses);

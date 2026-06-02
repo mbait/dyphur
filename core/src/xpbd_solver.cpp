@@ -459,6 +459,8 @@ void XpbdSolver::solve(Stream& s, const ContactView& cv,
                 float vrel_x = vcax - vcbx, vrel_y = vcay - vcby, vrel_z = vcaz - vcbz;
                 float vrel_n = vrel_x*nx + vrel_y*ny + vrel_z*nz;
 
+                // ── Normal velocity correction (restitution-free) ────────────
+                // Only removes the approaching component; resting/separating skipped.
                 if (vrel_n < 0.f) {
                     float j_n = -vrel_n / w_total;
                     bv.vel_x[ia] += wa*j_n*nx; bv.vel_y[ia] += wa*j_n*ny; bv.vel_z[ia] += wa*j_n*nz;
@@ -468,32 +470,52 @@ void XpbdSolver::solve(Stream& s, const ContactView& cv,
                     world_inv_inertia(bv, ib, rbxnx, rbxny, rbxnz, dob_x, dob_y, dob_z);
                     bv.ang_x[ia] += j_n*doa_x; bv.ang_y[ia] += j_n*doa_y; bv.ang_z[ia] += j_n*doa_z;
                     bv.ang_x[ib] -= j_n*dob_x; bv.ang_y[ib] -= j_n*dob_y; bv.ang_z[ib] -= j_n*dob_z;
+                }
 
-                    // ── Coulomb friction ─────────────────────────────────────
-                    if (mu > 0.f) {
-                        float vt_x = vrel_x - vrel_n*nx;
-                        float vt_y = vrel_y - vrel_n*ny;
-                        float vt_z = vrel_z - vrel_n*nz;
-                        float vt2  = vt_x*vt_x + vt_y*vt_y + vt_z*vt_z;
-                        if (vt2 > 1e-12f) {
-                            float vt_len = sycl::sqrt(vt2);
-                            float tx = vt_x/vt_len, ty = vt_y/vt_len, tz = vt_z/vt_len;
-                            float ratx = ray*tz - raz*ty, raty = raz*tx - rax*tz, ratz = rax*ty - ray*tx;
-                            float rbtx = rby*tz - rbz*ty, rbty = rbz*tx - rbx*tz, rbtz = rbx*ty - rby*tx;
-                            float fIa_x, fIa_y, fIa_z, fIb_x, fIb_y, fIb_z;
-                            world_inv_inertia(bv, ia, ratx, raty, ratz, fIa_x, fIa_y, fIa_z);
-                            world_inv_inertia(bv, ib, rbtx, rbty, rbtz, fIb_x, fIb_y, fIb_z);
-                            float wt = wa + wb
-                                     + ratx*fIa_x + raty*fIa_y + ratz*fIa_z
-                                     + rbtx*fIb_x + rbty*fIb_y + rbtz*fIb_z;
-                            if (wt > 1e-10f) {
-                                float j_t = vt_len / wt;
-                                j_t = sycl::fmin(j_t, mu * j_n);  // Coulomb clamp
-                                bv.vel_x[ia] -= wa*j_t*tx; bv.vel_y[ia] -= wa*j_t*ty; bv.vel_z[ia] -= wa*j_t*tz;
-                                bv.vel_x[ib] += wb*j_t*tx; bv.vel_y[ib] += wb*j_t*ty; bv.vel_z[ib] += wb*j_t*tz;
-                                bv.ang_x[ia] -= j_t*fIa_x; bv.ang_y[ia] -= j_t*fIa_y; bv.ang_z[ia] -= j_t*fIa_z;
-                                bv.ang_x[ib] += j_t*fIb_x; bv.ang_y[ib] += j_t*fIb_y; bv.ang_z[ib] += j_t*fIb_z;
-                            }
+                // ── Coulomb friction (static + dynamic) ──────────────────────
+                // The friction bound is the *normal force* implied by the position
+                // solve, expressed as a momentum impulse: j_n_static = λ_n/(dt·w).
+                // lc[c] is the accumulated normal penetration resolved this step
+                // (the constraint multiplier with zero compliance), so it is nonzero
+                // for any sustained contact — giving correct static friction that
+                // holds resting stacks and friction grasps.  Recompute the
+                // contact-point relative velocity after the normal correction.
+                if (mu > 0.f) {
+                    float oax2=bv.ang_x[ia], oay2=bv.ang_y[ia], oaz2=bv.ang_z[ia];
+                    float obx2=bv.ang_x[ib], oby2=bv.ang_y[ib], obz2=bv.ang_z[ib];
+                    float vcax2 = bv.vel_x[ia] + oay2*raz - oaz2*ray;
+                    float vcay2 = bv.vel_y[ia] + oaz2*rax - oax2*raz;
+                    float vcaz2 = bv.vel_z[ia] + oax2*ray - oay2*rax;
+                    float vcbx2 = bv.vel_x[ib] + oby2*rbz - obz2*rby;
+                    float vcby2 = bv.vel_y[ib] + obz2*rbx - obx2*rbz;
+                    float vcbz2 = bv.vel_z[ib] + obx2*rby - oby2*rbx;
+                    float rvx = vcax2 - vcbx2, rvy = vcay2 - vcby2, rvz = vcaz2 - vcbz2;
+                    float rvn = rvx*nx + rvy*ny + rvz*nz;
+
+                    float vt_x = rvx - rvn*nx;
+                    float vt_y = rvy - rvn*ny;
+                    float vt_z = rvz - rvn*nz;
+                    float vt2  = vt_x*vt_x + vt_y*vt_y + vt_z*vt_z;
+                    if (vt2 > 1e-12f) {
+                        float vt_len = sycl::sqrt(vt2);
+                        float tx = vt_x/vt_len, ty = vt_y/vt_len, tz = vt_z/vt_len;
+                        float ratx = ray*tz - raz*ty, raty = raz*tx - rax*tz, ratz = rax*ty - ray*tx;
+                        float rbtx = rby*tz - rbz*ty, rbty = rbz*tx - rbx*tz, rbtz = rbx*ty - rby*tx;
+                        float fIa_x, fIa_y, fIa_z, fIb_x, fIb_y, fIb_z;
+                        world_inv_inertia(bv, ia, ratx, raty, ratz, fIa_x, fIa_y, fIa_z);
+                        world_inv_inertia(bv, ib, rbtx, rbty, rbtz, fIb_x, fIb_y, fIb_z);
+                        float wt = wa + wb
+                                 + ratx*fIa_x + raty*fIa_y + ratz*fIa_z
+                                 + rbtx*fIb_x + rbty*fIb_y + rbtz*fIb_z;
+                        if (wt > 1e-10f) {
+                            // Coulomb bound from the position-solve normal impulse.
+                            float j_n_static = lc[c] / (dt * w_total);
+                            float j_t = vt_len / wt;
+                            j_t = sycl::fmin(j_t, mu * j_n_static);
+                            bv.vel_x[ia] -= wa*j_t*tx; bv.vel_y[ia] -= wa*j_t*ty; bv.vel_z[ia] -= wa*j_t*tz;
+                            bv.vel_x[ib] += wb*j_t*tx; bv.vel_y[ib] += wb*j_t*ty; bv.vel_z[ib] += wb*j_t*tz;
+                            bv.ang_x[ia] -= j_t*fIa_x; bv.ang_y[ia] -= j_t*fIa_y; bv.ang_z[ia] -= j_t*fIa_z;
+                            bv.ang_x[ib] += j_t*fIb_x; bv.ang_y[ib] += j_t*fIb_y; bv.ang_z[ib] += j_t*fIb_z;
                         }
                     }
                 }

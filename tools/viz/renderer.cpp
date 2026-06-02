@@ -1,4 +1,5 @@
 #include "renderer.hpp"
+#include <Corrade/Containers/ArrayView.h>
 #include <Magnum/GL/Buffer.h>
 #include <Magnum/GL/Renderer.h>
 #include <Magnum/Math/Quaternion.h>
@@ -35,34 +36,50 @@ Renderer::Renderer(std::unordered_map<uint32_t, std::string> meshmap)
 GL::Mesh Renderer::load_stl_mesh(const std::string& path)
 {
     // Binary STL: 80-byte header, uint32 n_tri, then per-triangle:
-    //   float[3] normal, float[3]*3 vertices, uint16 attribute.
+    //   float[3] normal, float[3]*3 vertices, uint16 attribute (50 bytes/triangle).
     // We upload one position + one normal per vertex (flat shading: face normal repeated).
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        std::fprintf(stderr, "renderer: cannot open STL %s — using box\n", path.c_str());
+    auto fallback = [&](const char* why) {
+        std::fprintf(stderr, "renderer: %s (%s) — using box\n", why, path.c_str());
         return MeshTools::compile(Primitives::cubeSolid());
-    }
+    };
 
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return fallback("cannot open STL");
+
+    f.seekg(0, std::ios::end);
+    const std::streamoff fsize = f.tellg();
     f.seekg(80);
     uint32_t n_tri = 0;
     f.read(reinterpret_cast<char*>(&n_tri), 4);
+    if (!f) return fallback("truncated STL header");
+
+    // Validate against the file size so a garbage count can't allocate wildly or
+    // read past EOF (which on some drivers corrupts the GL upload).
+    const std::streamoff expected = 84 + static_cast<std::streamoff>(n_tri) * 50;
+    if (n_tri == 0 || fsize < expected)
+        return fallback("not a valid binary STL");
 
     struct Vertex { float px, py, pz, nx, ny, nz; };
     std::vector<Vertex> verts;
-    verts.reserve(n_tri * 3);
+    verts.reserve(static_cast<std::size_t>(n_tri) * 3);
 
     for (uint32_t t = 0; t < n_tri; ++t) {
         float buf[12]; // normal(3) + v0(3) + v1(3) + v2(3)
-        f.read(reinterpret_cast<char*>(buf), 48);
+        if (!f.read(reinterpret_cast<char*>(buf), 48)) break;
         f.ignore(2);
         float nx = buf[0], ny = buf[1], nz = buf[2];
         for (int v = 0; v < 3; ++v)
             verts.push_back({buf[3+v*3], buf[4+v*3], buf[5+v*3], nx, ny, nz});
     }
+    if (verts.empty()) return fallback("no triangles read from STL");
 
     GL::Buffer vbo;
-    vbo.setData(Containers::ArrayView<const void>(verts.data(),
-                verts.size() * sizeof(Vertex)));
+    // Use a *typed* array view (element count = verts.size()); it converts to the
+    // byte-sized void view Magnum needs.  A hand-built ArrayView<const void> with a
+    // byte count can bind to the typed (element-count) constructor instead, claiming
+    // sizeof(Vertex)× too many bytes — harmless on NVIDIA (lazy DMA upload) but a
+    // hard out-of-bounds read in Mesa's eager memcpy (Intel) → crash.
+    vbo.setData(Containers::arrayView(verts.data(), verts.size()));
 
     GL::Mesh mesh;
     mesh.setPrimitive(GL::MeshPrimitive::Triangles)

@@ -367,7 +367,9 @@ int main(int argc, char** argv)
 
     Device dev = [&]() -> Device {
         if (force_cpu) return Device::default_cpu();
-        try { return Device::default_gpu(); }
+        // preferred() only picks a GPU on a GPU-backend build; on OMP it returns
+        // the CPU device (avoids selecting a launcher-less GPU that aborts on use).
+        try { return Device::preferred(); }
         catch (...) { return Device::default_cpu(); }
     }();
     auto s = dev.make_stream();

@@ -37,6 +37,13 @@ if(DYPHUR_SANITIZER)
     message(STATUS "dyphur: sanitizer = ${DYPHUR_SANITIZER}")
 endif()
 
+# Expose the compiled backend to all source as DYPHUR_BACKEND_IS_<X>=1 so code can
+# tell whether GPU kernels exist in this build.  AdaptiveCpp still enumerates a
+# physical GPU even in an OMP-only build, so a gpu_selector would pick a device
+# that has no kernel launcher and abort at first launch; selection code must gate
+# the GPU path on this macro rather than rely on a (non-throwing) selector.
+add_compile_definitions(DYPHUR_BACKEND_IS_${DYPHUR_BACKEND}=1)
+
 # Map DYPHUR_BACKEND to ACPP_TARGETS (AdaptiveCpp compilation target string).
 # ACPP_TARGETS can be overridden on the command line, e.g.:
 #   -DACPP_TARGETS="cuda:sm_90"   for H100

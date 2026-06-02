@@ -356,9 +356,10 @@ int main(int argc, char** argv)
         else n_frames = std::atoi(argv[i]);
     }
 
-    // Asset directory: next to the executable.
-    std::filesystem::path exe(argv[0]);
-    std::string asset_dir = (exe.parent_path() / "assets").string();
+    // Asset directory: the committed source tree (set at build time), so the URDF
+    // and the absolute mesh paths written to <prefix>.meshmap resolve the same way
+    // regardless of which build/config produced the trajectory or where viz runs.
+    std::string asset_dir = DYPHUR_MANIP_ASSET_DIR;
 
     spdlog::info("dyphur manipulator_pick: {} frames, prefix='{}'", n_frames, prefix);
 

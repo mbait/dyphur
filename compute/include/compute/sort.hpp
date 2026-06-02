@@ -5,13 +5,26 @@
 
 namespace dyphur {
 
+// The single-kernel fast path keeps all bitonic passes on-chip in work-group
+// local memory, synchronised by work-group barriers.  That is correct and fast
+// on real GPUs, but AdaptiveCpp's OpenMP (CPU) backend does not reliably
+// synchronise a single work-group's local barriers for this access pattern, so
+// the sort silently produces an unsorted result there.  Restrict the fast path
+// to GPU backends; the CPU/OMP build uses the multi-launch path, whose steps are
+// separate global kernels ordered by the in-order queue (no work-group barriers).
+#if defined(DYPHUR_BACKEND_IS_CUDA) || defined(DYPHUR_BACKEND_IS_HIP) || defined(DYPHUR_BACKEND_IS_L0)
+#define DYPHUR_SORT_LOCAL_FASTPATH 1
+#else
+#define DYPHUR_SORT_LOCAL_FASTPATH 0
+#endif
+
 // Parallel bitonic sort of (keys, values) by ascending key.
 //
 // Deterministic: the swap network is a fixed comparison network.
 // n must be a power of 2.
-// For n ≤ 1024: single kernel launch using work-group local memory — all
+// GPU + n ≤ 1024: single kernel launch using work-group local memory — all
 // bitonic passes execute on-chip without PCIe round-trips between steps.
-// For n > 1024: O(log²n) kernel submissions (in-order queue serialises them).
+// Otherwise: O(log²n) kernel submissions (in-order queue serialises them).
 // Caller must call stream.wait() to synchronize before reading results.
 template<typename Key, typename Value>
 void sort_by_key(Stream& s, Key* keys, Value* values, size_t n) {
@@ -19,7 +32,7 @@ void sort_by_key(Stream& s, Key* keys, Value* values, size_t n) {
 
     auto& q = s.queue();
 
-    if (n <= 1024) {
+    if (DYPHUR_SORT_LOCAL_FASTPATH && n <= 1024) {
         // Single kernel: load into local memory, run all passes with barriers,
         // write back. Reduces GPU kernel launches from O(log²n) to 1.
         q.submit([&](sycl::handler& h) {
@@ -79,7 +92,7 @@ void sort(Stream& s, Key* keys, size_t n) {
 
     auto& q = s.queue();
 
-    if (n <= 1024) {
+    if (DYPHUR_SORT_LOCAL_FASTPATH && n <= 1024) {
         q.submit([&](sycl::handler& h) {
             sycl::local_accessor<Key, 1> lk(sycl::range<1>(n), h);
             h.parallel_for(

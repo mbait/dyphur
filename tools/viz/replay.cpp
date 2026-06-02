@@ -1,9 +1,14 @@
 #include "replay.hpp"
 #include "renderer.hpp"
+#include <Corrade/PluginManager/Manager.h>
 #include <Magnum/GL/DefaultFramebuffer.h>
 #include <Magnum/GL/Renderer.h>
+#include <Magnum/Image.h>
+#include <Magnum/ImageView.h>
 #include <Magnum/Math/Matrix4.h>
+#include <Magnum/PixelFormat.h>
 #include <Magnum/Platform/GlfwApplication.h>
+#include <Magnum/Trade/AbstractImageConverter.h>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -68,10 +73,38 @@ private:
 
         std::printf("replay: %u bodies, %zu frames, %.1f fps playback\n",
                     _scene.n_bodies, _frames.size(), 1.f / _frame_dt);
+        std::printf("replay: space=pause  ←/→=step  S=snapshot  Q=quit\n");
+
+        // Snapshot filename base = the prefix without any directory part, so
+        // captures land in the cwd as "<name>-<frame>.png".
+        _name = _prefix;
+        auto slash = _name.find_last_of("/\\");
+        if (slash != std::string::npos) _name = _name.substr(slash + 1);
 
         auto meshmap = read_meshmap(_prefix);
         _renderer = std::make_unique<Renderer>(std::move(meshmap));
         updateCamera();
+    }
+
+    // Write the just-rendered frame as "<name>-<frame>.png", zero-padded so the
+    // frame number fits the width of the last frame's index.
+    void saveSnapshot() {
+        Image2D image{PixelFormat::RGBA8Unorm};
+        GL::defaultFramebuffer.read(GL::defaultFramebuffer.viewport(), image);
+
+        const int last   = static_cast<int>(_frames.size()) - 1;
+        const int digits  = static_cast<int>(std::to_string(last).size());
+        char fname[1024];
+        std::snprintf(fname, sizeof(fname), "%s-%0*d.png",
+                      _name.c_str(), digits, _cur_frame);
+
+        static Corrade::PluginManager::Manager<Trade::AbstractImageConverter> manager;
+        auto converter = manager.loadAndInstantiate("StbPngImageConverter");
+        if (!converter || !converter->exportToFile(image, fname)) {
+            std::fprintf(stderr, "replay: failed to write snapshot %s\n", fname);
+            return;
+        }
+        std::printf("replay: wrote snapshot %s\n", fname);
     }
 
     void drawEvent() override {
@@ -90,6 +123,7 @@ private:
         }
 
         _renderer->draw(_scene, _frames[_cur_frame]);
+        if (_want_snapshot) { saveSnapshot(); _want_snapshot = false; }
         swapBuffers();
         redraw();
     }
@@ -103,6 +137,8 @@ private:
         } else if (e.key() == KeyEvent::Key::Left) {
             _paused = true;
             if (_cur_frame > 0) --_cur_frame;
+        } else if (e.key() == KeyEvent::Key::S) {
+            _want_snapshot = true;  // captured in drawEvent after the frame renders
         } else if (e.key() == KeyEvent::Key::Q || e.key() == KeyEvent::Key::Esc) {
             exit(0);
         }
@@ -163,6 +199,7 @@ private:
     }
 
     std::string              _prefix;
+    std::string              _name;   // prefix basename, for snapshot filenames
     float                    _frame_dt;
     bool                     _loop;
     SceneFileDesc            _scene;
@@ -172,6 +209,7 @@ private:
     int   _cur_frame  = 0;
     float _time_acc   = 0.f;
     bool  _paused     = false;
+    bool  _want_snapshot = false;
 
     float _azimuth   = 0.5f;
     float _elevation = 0.5f;

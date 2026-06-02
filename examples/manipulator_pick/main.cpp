@@ -628,9 +628,23 @@ int main(int argc, char** argv)
         q_queue.memcpy(hqz.data(), bv.rot_z, N_BODIES * sizeof(float)).wait();
     };
 
+    // The simulation is z-up (Panda/SDF convention) but the viz tools assume y-up.
+    // Rotate each pose by -90° about x (z-up → y-up) when writing the trajectory so
+    // it renders upright.  The determinism hash uses the untransformed sim state,
+    // so this affects visualisation only.
+    //   position: (x, y, z) → (x, z, -y)
+    //   rotation: q → q_R ⊗ q,  q_R = (cos-45°, sin-45°, 0, 0)
     auto write_traj_frame = [&]() {
+        constexpr float c = 0.70710678f, sgn = -0.70710678f;  // cos/sin(-45°)
         for (int i = 0; i < N_BODIES; ++i) {
-            float row[7] = {hx[i], hy[i], hz[i], hw[i], hqx[i], hqy[i], hqz[i]};
+            float w = hw[i], x = hqx[i], y = hqy[i], z = hqz[i];
+            float row[7] = {
+                hx[i], hz[i], -hy[i],
+                c*w - sgn*x,   // qw
+                c*x + sgn*w,   // qx
+                c*y - sgn*z,   // qy
+                c*z + sgn*y,   // qz
+            };
             traj.write(reinterpret_cast<const char*>(row), sizeof(row));
         }
     };

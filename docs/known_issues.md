@@ -113,13 +113,65 @@ operations that are "correct to last-place" on either path.
 
 ---
 
-## Issue 2 — 1025-body stress test runs at 51 fps (0.86× realtime)
+## Issue 2 — 1025-body stress test runs sub-realtime on CUDA (~55 fps)
 
-**Status**: Issues 2b and 2c resolved (2026-05-28). Issue 2a partially resolved. Measured on RTX 3060, Release build, `cuda` preset.
+**Status**: original sub-causes 2b/2c resolved, 2a largely neutralised; **the
+dominant cost has moved** — see "Re-profile (2026-06-03)" below. Measured on RTX
+3060, Release, `cuda` preset.
 **Target**: v0.1 demo goal is ≥ realtime (≥60 fps) for 1025 bodies
-**Current**: `stress_test_blocks` with 1025 bodies, 600 frames → **51 fps**
+**Current**: ~55 fps warm (~36 fps cold/JIT), 300 frames.
 
-Three independent sub-causes, each fixable in isolation.
+---
+
+### Re-profile (2026-06-03) — the bottleneck is now the sequential narrowphase + solver
+
+The Phase 5.5 broadphase work (single-kernel sort for n ≤ 1024, parallel refit)
+**solved the original bottleneck**: the sort that was 77% of frame time is now 2.7%.
+Re-profiling the *current* pipeline (per-stage `s.wait()` barriers, 1025 bodies,
+~3 765 contacts/frame, avg over 170 warm frames) shows the cost has entirely
+relocated:
+
+| Stage           | ms/frame | Share |
+|-----------------|----------|-------|
+| **narrowphase** | **9.42** | **47.4%** |
+| **solve (XPBD)**| **9.03** | **45.5%** |
+| build_and_query | 0.80     | 4.0%  |
+| sort_pairs      | 0.53     | 2.7%  |
+| integrate       | 0.04     | 0.2%  |
+| download_count  | 0.03     | 0.2%  |
+| **total**       | **19.85**| 50.4 fps |
+
+**Root cause**: the **narrowphase and the XPBD solver are dispatched as
+single-work-item kernels** — `parallel_for(s, 1, …)` at `core/src/narrowphase.cpp:1055,
+1077` and `core/src/xpbd_solver.cpp:390`. All ~3 765 contacts are processed
+sequentially on **one** GPU thread (the solver does it ×10 iterations). A single
+GPU core (~1.3 GHz, scalar, no ILP) is far slower than a single CPU core (~3.2 GHz,
+wide out-of-order), which is exactly why OpenMP (205 fps) beats CUDA here — and why
+the GPU loses at every current scene size. This is the deliberate determinism
+mechanism from `REPORT.md` §4.6 (single-work-item narrowphase + solver give a fixed,
+reproducible contact-processing order), now exposed as the headline cost once the
+broadphase was parallelised.
+
+**Fix direction** (this is the real v0.1-perf work, larger than 2a–2c):
+- *Narrowphase* — embarrassingly parallel: each candidate pair is independent. Run
+  `parallel_for(n_pairs)` and have each pair write its contacts to **fixed,
+  pair-indexed slots** (not an atomic append) so the output stays deterministic.
+  Should recover most of the 9.4 ms with no determinism cost.
+- *Solver* — harder: XPBD is Gauss–Seidel with a sequential dependency between
+  contacts that share a body. Determinism + parallelism needs graph colouring or
+  contact-island partitioning (parallel within a colour/island, fixed colour order),
+  or a Jacobi-style sweep with under-relaxation. This is a solver redesign, not a
+  dispatch change.
+- Until then, the single-GPU-thread narrowphase+solver caps CUDA frame rate
+  regardless of broadphase improvements.
+
+> Note: parallelising the solver interacts with determinism (Issue 4) — any parallel
+> contact solve must fix a reproducible processing order, the same constraint that
+> the parallel BVH refit violated.
+
+---
+
+### Original analysis (2026-05-28) — three sub-causes, now largely historical
 
 ---
 
@@ -334,14 +386,103 @@ the OMP Debug build.
 
 ---
 
+## Issue 4 — CUDA non-determinism at scale (parallel BVH refit AABB-merge race)
+
+**Status**: open (backlog). Measured on RTX 3060, Release, `cuda` preset, 2026-06-03.
+**Affected**: `stress_test_blocks` (1 025 bodies) and any CUDA scene with a deep BVH.
+**Not affected**: OpenMP (all sizes); CUDA small/medium scenes (`manipulator_pick`,
+`arm_push`, both `test_core_sim_determinism` golden-gate scenes).
+
+### Symptom
+
+`stress_test_blocks` on CUDA produces a **different final-state hash on every run**,
+and the demo's own `avg_contacts_per_frame` swings between runs:
+
+```
+run1 avg_contacts: 3387    hash: 516d56cec7d78bfe
+run2 avg_contacts: 3384    hash: 95b6edff697b0926
+run3 avg_contacts: 1707    hash: 5b14924f25a02186
+```
+
+The contact count diverges **before the solver runs**, so the non-determinism
+originates in the broadphase, not the XPBD solve.
+
+### Root cause
+
+Issue 2b's resolution replaced the single-work-item BVH refit with a Karras
+*parallel* refit (`parallel_for(s, n_int, …)` in `core/src/broadphase.cpp`, Step 6).
+Each leaf walks up to the root; at each internal node an `atomic_add_seq` flag lets
+the **second** arriving thread merge the two children's AABBs:
+
+```cpp
+uint32_t old = atomic_add_seq(d_flags + p, 1u);
+if (old == 0u) break;                       // first arrival: bail
+int lc = d_lft[p], rc = d_rgt[p];
+float pmnx = min(d_mn_x[lc], d_mn_x[rc]);   // <-- reads child AABBs
+...
+```
+
+The `atomic_add_seq` orders the *flag*, but the child AABB stores are **plain
+(non-atomic) `sycl::half` writes**. On CUDA the device-scope atomic does not reliably
+establish happens-before for those non-atomic writes (the same memory-model gap the
+original single-work-item refit was written to avoid — see §4.6 of `REPORT.md`). The
+second thread can therefore read a child AABB that the first thread has not yet
+flushed, getting a stale/default value. That corrupts the internal node's AABB,
+changing which leaf pairs the traversal reports — non-deterministically, and
+differently each run. Shallow trees (small scenes) almost never hit the window;
+the deep tree at 1 025 bodies does.
+
+This is **not caught by CI**: `test_core_sim_determinism` uses an 8-box and a 2-link
+scene whose BVHs are 3–4 levels deep.
+
+### Relevant code
+
+- Parallel refit: `core/src/broadphase.cpp` Step 6 (the `parallel_for(s, n_int, …)`
+  bottom-up walk with `atomic_add_seq(d_flags + p, …)`).
+- `atomic_add_seq`: `compute/include/compute/atomic.hpp`.
+
+### Fix options
+
+1. **Revert to single-work-item refit** (`parallel_for(s, 1u, …)` looping all leaves) —
+   simplest, restores determinism, reintroduces Issue 2b's serial cost (was a small
+   share of frame time vs the sort). Lowest risk.
+2. **Correctly fence the parallel refit** — promote the child-AABB stores to atomics,
+   or add an explicit cross-work-item fence with the right scope, so the AABB writes
+   are ordered against the flag. Keeps the parallelism; needs careful validation of
+   AdaptiveCpp's fence support per backend.
+3. **Two-pass refit** — process the tree one level at a time with a queue-ordered
+   `parallel_for` per level (separate kernels ⇒ implicit global ordering), avoiding
+   intra-kernel cross-thread reads. Deterministic and parallel, at the cost of
+   `tree_depth` kernel launches.
+
+### Verification
+
+Add a large-scene case to `test_core_sim_determinism` (e.g. 256+ bodies, run twice,
+`REQUIRE(h1 == h2)`) so this class of bug is gated, then confirm
+`stress_test_blocks` returns an identical hash across 3 runs on CUDA.
+
+---
+
 ## Summary table
 
 | ID  | Issue                                              | File(s)                                          | Effort | Impact      |
 |-----|----------------------------------------------------|--------------------------------------------------|--------|-------------|
 | 1   | ~~`test_core_math_equiv` 1-ULP CUDA failure (FMA)~~    | resolved 2026-05-28                          | —      | ✅ resolved |
-| 2a  | Bitonic sort: O(log²n) kernel launches (n > 1024)  | `compute/include/compute/sort.hpp`               | M      | ~3× fps (n>1024 only) |
-| 2b  | ~~Sequential BVH refit~~                           | resolved 2026-05-28                              | —      | ✅ resolved |
+| 2   | **CUDA stress sub-realtime — single-work-item narrowphase + solver = 93% of frame time** | `core/src/narrowphase.cpp:1055,1077`, `core/src/xpbd_solver.cpp:390` | L | ~2× fps (parallelise narrowphase; solver needs colouring) |
+| 2a  | Bitonic sort: O(log²n) kernel launches (n > 1024)  | `compute/include/compute/sort.hpp`               | M      | now ~3% of frame (was 77%) |
+| 2b  | ~~Sequential BVH refit~~                           | resolved 2026-05-28 (caused Issue 4)             | —      | ✅ resolved |
 | 2c  | ~~Extra `np.download_count` sync per frame~~        | resolved 2026-05-28                              | —      | ✅ resolved |
 | 3   | ~~`test_core_articulation` SIGSEGV (Fixed/Revolute)~~  | resolved in Phase 5                          | —      | ✅ resolved  |
+| 4   | CUDA non-determinism at scale (parallel BVH refit AABB race) | `core/src/broadphase.cpp` (Step 6 refit)  | M      | correctness (deep-BVH CUDA scenes) |
 
-Remaining open: Issue 2a for n > 1024 pairs (requires oneDPL/CUB or a multi-pass radix sort).
+Remaining open:
+- **Issue 2** — sequential narrowphase + XPBD solver dominate CUDA frame time (93%);
+  parallelising them is the main v0.1 perf lever (narrowphase easy, solver needs
+  colouring/islands).
+- **Issue 2a** — n > 1024 pair sort still multi-launch (oneDPL/CUB or radix sort);
+  minor now.
+- **Issue 4** — parallel-refit AABB-merge race breaks CUDA determinism at scale.
+
+> **Note** — Issues 2b and 4 are linked: parallelising the refit (2b) is what
+> introduced the AABB-merge race (4). A fix for 4 must preserve, not undo, 2b's
+> speedup (fix options 2 or 3 above), or knowingly trade it back (option 1).

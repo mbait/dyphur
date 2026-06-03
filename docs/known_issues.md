@@ -113,13 +113,30 @@ operations that are "correct to last-place" on either path.
 
 ---
 
-## Issue 2 — 1025-body stress test runs sub-realtime on CUDA (~55 fps)
+## Issue 2 — 1025-body stress test runs sub-realtime on CUDA
 
-**Status**: original sub-causes 2b/2c resolved, 2a largely neutralised; **the
-dominant cost has moved** — see "Re-profile (2026-06-03)" below. Measured on RTX
-3060, Release, `cuda` preset.
-**Target**: v0.1 demo goal is ≥ realtime (≥60 fps) for 1025 bodies
-**Current**: ~55 fps warm (~36 fps cold/JIT), 300 frames.
+**Status**: narrowphase now parallelised (2026-06-03) → **~55 → ~101 fps warm**
+on RTX 3060; the remaining cost is the single-work-item XPBD solver. 2b/2c
+resolved, 2a neutralised. Measured Release, `cuda` preset.
+**Target**: v0.1 demo goal is ≥ realtime (≥60 fps) for 1025 bodies — **met** at
+~101 fps warm (still ~36 fps on the cold JIT run).
+**Remaining**: the XPBD solver is still a single GPU work-item (~46% of the
+*pre-fix* frame time); parallelising it needs graph colouring / contact islands.
+
+### Update (2026-06-03) — narrowphase parallelised
+
+`core/src/narrowphase.cpp`: the contact tests now run one work-item per candidate
+pair, appending to a scratch store with a `(pair_idx, sub_idx)` key, then sorting
+by key and gathering into the main store — reproducing the sequential pair order
+so the contact set/order and determinism are preserved (mesh pairs with unbounded
+contacts are handled because ordering is by key, not fixed slots). The narrowphase
+stage dropped from ~9.4 ms to ~1 ms/frame; stress went ~55 → ~101 fps warm.
+CPU/OpenMP output is bit-identical; CUDA contact values shift ≤1 ULP from FMA
+contraction differing between the wide `parallel_for` and the old single-thread
+loop (same effect as Issue 1), which deterministically changes the
+manipulator_pick CUDA hash (grasp still succeeds).
+
+The solver remains; see "Fix direction → Solver" below.
 
 ---
 
@@ -152,18 +169,16 @@ mechanism from `REPORT.md` §4.6 (single-work-item narrowphase + solver give a f
 reproducible contact-processing order), now exposed as the headline cost once the
 broadphase was parallelised.
 
-**Fix direction** (this is the real v0.1-perf work, larger than 2a–2c):
-- *Narrowphase* — embarrassingly parallel: each candidate pair is independent. Run
-  `parallel_for(n_pairs)` and have each pair write its contacts to **fixed,
-  pair-indexed slots** (not an atomic append) so the output stays deterministic.
-  Should recover most of the 9.4 ms with no determinism cost.
-- *Solver* — harder: XPBD is Gauss–Seidel with a sequential dependency between
-  contacts that share a body. Determinism + parallelism needs graph colouring or
-  contact-island partitioning (parallel within a colour/island, fixed colour order),
-  or a Jacobi-style sweep with under-relaxation. This is a solver redesign, not a
-  dispatch change.
-- Until then, the single-GPU-thread narrowphase+solver caps CUDA frame rate
-  regardless of broadphase improvements.
+**Fix direction**:
+- *Narrowphase* — ✅ **done** (2026-06-03, see Update above). Parallelised via
+  scratch-append + key sort + gather rather than fixed pair-indexed slots, which
+  also handles mesh pairs (unbounded contacts/pair). ~9.4 ms → ~1 ms.
+- *Solver* — **remaining, harder**: XPBD is Gauss–Seidel with a sequential
+  dependency between contacts that share a body. Determinism + parallelism needs
+  graph colouring or contact-island partitioning (parallel within a colour/island,
+  fixed colour order), or a Jacobi-style sweep with under-relaxation. This is a
+  solver redesign, not a dispatch change, and interacts with the determinism
+  constraint (Issue 4). It is now the single largest GPU cost.
 
 > Note: parallelising the solver interacts with determinism (Issue 4) — any parallel
 > contact solve must fix a reproducible processing order, the same constraint that
@@ -468,7 +483,7 @@ Add a large-scene case to `test_core_sim_determinism` (e.g. 256+ bodies, run twi
 | ID  | Issue                                              | File(s)                                          | Effort | Impact      |
 |-----|----------------------------------------------------|--------------------------------------------------|--------|-------------|
 | 1   | ~~`test_core_math_equiv` 1-ULP CUDA failure (FMA)~~    | resolved 2026-05-28                          | —      | ✅ resolved |
-| 2   | **CUDA stress sub-realtime — single-work-item narrowphase + solver = 93% of frame time** | `core/src/narrowphase.cpp:1055,1077`, `core/src/xpbd_solver.cpp:390` | L | ~2× fps (parallelise narrowphase; solver needs colouring) |
+| 2   | CUDA stress sub-realtime. **Narrowphase parallelised** (~55→~101 fps); single-work-item XPBD solver remains | ~~`narrowphase.cpp`~~ done; `core/src/xpbd_solver.cpp:390` | L | solver: needs graph colouring / islands |
 | 2a  | Bitonic sort: O(log²n) kernel launches (n > 1024)  | `compute/include/compute/sort.hpp`               | M      | now ~3% of frame (was 77%) |
 | 2b  | ~~Sequential BVH refit~~                           | resolved 2026-05-28 (caused Issue 4)             | —      | ✅ resolved |
 | 2c  | ~~Extra `np.download_count` sync per frame~~        | resolved 2026-05-28                              | —      | ✅ resolved |
@@ -476,9 +491,8 @@ Add a large-scene case to `test_core_sim_determinism` (e.g. 256+ bodies, run twi
 | 4   | CUDA non-determinism at scale (parallel BVH refit AABB race) | `core/src/broadphase.cpp` (Step 6 refit)  | M      | correctness (deep-BVH CUDA scenes) |
 
 Remaining open:
-- **Issue 2** — sequential narrowphase + XPBD solver dominate CUDA frame time (93%);
-  parallelising them is the main v0.1 perf lever (narrowphase easy, solver needs
-  colouring/islands).
+- **Issue 2** — narrowphase parallelised (~55→~101 fps); the single-work-item XPBD
+  **solver** is now the largest GPU cost and needs graph colouring / contact islands.
 - **Issue 2a** — n > 1024 pair sort still multi-launch (oneDPL/CUB or radix sort);
   minor now.
 - **Issue 4** — parallel-refit AABB-merge race breaks CUDA determinism at scale.

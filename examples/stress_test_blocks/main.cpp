@@ -18,6 +18,7 @@
 #include "../common/scene_io.hpp"
 #include <spdlog/spdlog.h>
 #include <fmt/format.h>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -43,11 +44,18 @@ int main(int argc, char** argv) {
     std::string prefix  = "stress_test_blocks";
     int         n_frames = 300;
 
-    bool force_cpu = false;
+    bool force_cpu = false, profile = false;
+    int  gnx = 8, gny = 16, gnz = 8;   // default grid = 1 024 dynamic boxes
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--cpu") { force_cpu = true; continue; }
-        if (prefix == "stress_test_blocks") prefix = argv[i];
-        else n_frames = std::atoi(argv[i]);
+        std::string a = argv[i];
+        if (a == "--cpu")     { force_cpu = true; continue; }
+        if (a == "--profile") { profile   = true; continue; }
+        if (a == "--grid" && i + 3 < argc) {
+            gnx = std::atoi(argv[++i]); gny = std::atoi(argv[++i]); gnz = std::atoi(argv[++i]);
+            continue;
+        }
+        if (prefix == "stress_test_blocks") prefix = a;
+        else n_frames = std::atoi(a.c_str());
     }
 
     spdlog::info("dyphur stress_test_blocks: {} frames, prefix='{}'", n_frames, prefix);
@@ -61,16 +69,18 @@ int main(int argc, char** argv) {
     auto& q  = s.queue();
 
     // ── Scene dimensions ──────────────────────────────────────────────────────
-    constexpr int NX = 8, NZ = 8, NY = 16;          // 8×16×8 = 1 024 dynamic boxes
-    constexpr int N_DYN    = NX * NY * NZ;
-    constexpr int N_BODIES = N_DYN + 1;              // +1 static ground
+    const int NX = gnx, NZ = gnz, NY = gny;         // default 8×16×8 = 1 024 boxes
+    const int N_DYN    = NX * NY * NZ;
+    const int N_BODIES = N_DYN + 1;                  // +1 static ground
 
-    constexpr uint32_t MAX_PAIRS    = 65536u;
-    constexpr uint32_t MAX_CONTACTS = 16384u;
+    // Capacities scale with body count (the grid can now be 4k/8k+ via --grid).
+    const uint32_t MAX_PAIRS    = std::max<uint32_t>(65536u, static_cast<uint32_t>(N_DYN) * 32u);
+    const uint32_t MAX_CONTACTS = std::max<uint32_t>(16384u, static_cast<uint32_t>(N_DYN) * 8u);
 
     constexpr float BOX_H  = 0.4f;   // half-extent of dynamic boxes
     constexpr float GND_HY = 0.5f;   // ground half-height
-    constexpr float GND_HX = 20.f;   // ground half-width/depth
+    // Ground half-width grows with the footprint so all stacks land on the plate.
+    const float GND_HX = std::max(20.f, 0.5f * static_cast<float>(std::max(NX, NZ)) + 2.f);
 
     // ── Shapes ────────────────────────────────────────────────────────────────
     ShapeStore ss(s, 4);
@@ -138,11 +148,13 @@ int main(int argc, char** argv) {
 
     // ── Physics objects ───────────────────────────────────────────────────────
     constexpr float DT = 1.f / 60.f;
-    const AABB scene_bounds = { -25.f, -2.f, -25.f, 25.f, 22.f, 25.f };
+    const float bound_xz = GND_HX + 5.f;
+    const float bound_y  = std::max(22.f, GND_HY + static_cast<float>(NY) + 5.f);
+    const AABB scene_bounds = { -bound_xz, -2.f, -bound_xz, bound_xz, bound_y, bound_xz };
 
     Broadphase  bp(s, N_BODIES, MAX_PAIRS);
     Narrowphase np(s, MAX_CONTACTS);
-    XpbdSolver  solver(s, 10);
+    XpbdSolver  solver(s, 10, MAX_CONTACTS);   // lambda accumulator must fit all contacts
 
     IntegratorParams ip;
     ip.gravity    = { 0.f, -9.81f, 0.f };
@@ -179,6 +191,63 @@ int main(int argc, char** argv) {
             traj.write(reinterpret_cast<const char*>(row), sizeof(row));
         }
     };
+
+    // ── Profiling mode: per-stage timing with s.wait() barriers ──────────────
+    // Each stage is fenced so the wall time attributed to it is the real GPU
+    // cost (this adds sync overhead the pipelined run does not pay, so the
+    // stage-summed fps is a lower bound). Skips trajectory/golden output.
+    if (profile) {
+        const int N_WARM = 30;   // discard JIT + transient settling
+        spdlog::info("PROFILE: {} bodies, {} warmup + {} measured frames, grid {}x{}x{}",
+                     N_DYN, N_WARM, n_frames, NX, NY, NZ);
+
+        double t_int = 0, t_bp = 0, t_dl = 0, t_sort = 0, t_np = 0, t_solve = 0;
+        int    measured = 0;
+        uint32_t n_pairs = 0;
+
+        for (int frame = 0; frame < N_WARM + n_frames; ++frame) {
+            const bool meas = frame >= N_WARM;
+            Clock::time_point a;
+
+            a = Clock::now(); integrate(s, bv, ip); s.wait();
+            if (meas) t_int += Seconds(Clock::now() - a).count();
+
+            a = Clock::now(); bp.build_and_query(s, bv, sv, scene_bounds); s.wait();
+            if (meas) t_bp += Seconds(Clock::now() - a).count();
+
+            a = Clock::now(); n_pairs = bp.download_count(s);
+            if (meas) t_dl += Seconds(Clock::now() - a).count();
+
+            a = Clock::now(); bp.sort_pairs(s, n_pairs); s.wait();
+            if (meas) t_sort += Seconds(Clock::now() - a).count();
+
+            a = Clock::now(); np.run(s, bp.pairs_ptr(), n_pairs, bv, sv); s.wait();
+            if (meas) t_np += Seconds(Clock::now() - a).count();
+
+            a = Clock::now(); solver.solve(s, np.contacts(), JointView{}, bv, DT); s.wait();
+            if (meas) { t_solve += Seconds(Clock::now() - a).count(); ++measured; }
+        }
+        const uint32_t n_contacts = np.download_count(s);
+
+        const double k = 1000.0 / measured;   // → ms / frame
+        const double tot = (t_int + t_bp + t_dl + t_sort + t_np + t_solve) * k;
+        auto row = [&](const char* name, double t) {
+            const double ms = t * k;
+            spdlog::info("  {:<16} {:8.3f} ms   {:5.1f}%", name, ms, 100.0 * ms / tot);
+        };
+        spdlog::info("── Per-stage avg over {} warm frames ({} bodies, ~{} contacts/frame, {} pairs) ──",
+                     measured, N_DYN, n_contacts, n_pairs);
+        row("integrate",        t_int);
+        row("build_and_query",  t_bp);
+        row("download_count",   t_dl);
+        row("sort_pairs",       t_sort);
+        row("narrowphase",      t_np);
+        row("solve (XPBD)",     t_solve);
+        spdlog::info("  {:<16} {:8.3f} ms   ({:.1f} fps, stage-summed lower bound)",
+                     "TOTAL", tot, 1000.0 / tot);
+        spdlog::info("Device: {} ({})", dev.name(), dev.is_gpu() ? "GPU" : "CPU");
+        return 0;
+    }
 
     // ── Main simulation loop ──────────────────────────────────────────────────
     auto wall_start = Clock::now();

@@ -310,7 +310,46 @@ The single CUDA failure is `test_core_math_equiv` (host-vs-device math parity): 
 
 Same-backend, run-to-run determinism now holds **on both backends at all tested scene sizes** — manipulator_pick, arm_push, the three CI golden-gate scenes (§4.6), and `stress_test_blocks` (1 025 bodies). The CI determinism gate (`test_core_sim_determinism`: 8 boxes + 256-box stack + 2-link arm) passes bit-identically on both backends on every run.
 
-**`stress_test_blocks` (1 025 bodies) is now deterministic on CUDA** (`3b31b708569886eb` across runs), closing the former large-scene non-determinism. The root cause was the parallel BVH refit's cross-thread read of child AABBs ordered only by a device-scope atomic; it is fixed by the level-synchronised refit (§4.6), where each merge round is a separate queue-ordered kernel so parents read only previously-finalised children. The new 256-box determinism case in the CI gate exercises the deep-BVH / colored-solver path that the small golden scenes did not.
+**`stress_test_blocks` is now deterministic on CUDA at every scale tested** — 1 025 bodies (`3b31b708569886eb`), 4 097 bodies (`ba0aa6b74164e0ac`), and 8 193 bodies (`d31696ce471ce816`), each identical across runs — closing the former large-scene non-determinism. The root cause was the parallel BVH refit's cross-thread read of child AABBs ordered only by a device-scope atomic; it is fixed by the level-synchronised refit (§4.6), where each merge round is a separate queue-ordered kernel so parents read only previously-finalised children. The new 256-box determinism case in the CI gate exercises the deep-BVH / colored-solver path that the small golden scenes did not.
+
+### 9.4 Scaling — 1k / 4k / 8k bodies
+
+`stress_test_blocks` was profiled on CUDA at three grid sizes via `--grid NX NY NZ --profile`, which times each pipeline stage behind an `s.wait()` barrier (averaged over 200 frames after 30 warm-up frames). The barriers make each stage's wall time its true GPU cost but serialise the pipeline, so the stage-summed fps is a *lower bound*; the "pipelined warm" row is the actual end-to-end demo throughput (no per-stage barriers).
+
+| Stage | 1k (8×16×8) | 4k (16×16×16) | 8k (16×32×16) |
+|---|---|---|---|
+| integrate | 0.018 ms | 0.021 ms | 0.022 ms |
+| build_and_query | 0.92 ms (10.9 %) | 2.06 ms (19.5 %) | 2.97 ms (18.4 %) |
+| download_count | 0.018 ms | 0.024 ms | 0.025 ms |
+| sort_pairs | 0.53 ms (6.2 %) | 0.87 ms (8.2 %) | 1.17 ms (7.2 %) |
+| narrowphase | 0.51 ms (6.0 %) | 0.86 ms (8.1 %) | 0.95 ms (5.9 %) |
+| **solve (XPBD, colored)** | **6.48 ms (76.5 %)** | **6.72 ms (63.7 %)** | **11.05 ms (68.2 %)** |
+| **total (stage-summed)** | 8.47 ms | 10.56 ms | 16.20 ms |
+| stage-summed fps (lower bound) | 118 | 95 | 62 |
+| **pipelined warm fps** | **~235** | **~111** | **~78** |
+| contacts/frame (mid-settle) | ~3 700 | ~19 400 | ~36 700 |
+| candidate pairs/frame | ~7 500 | ~40 000 | ~85 000 |
+
+**The GPU holds above realtime (≥ 60 fps) through 8 192 bodies.** Findings:
+
+- **The colored solver dominates (64–77 %) but scales *sub-linearly*.** Solve is nearly flat 1k→4k (6.48 → 6.72 ms) despite 5× the contacts, then grows by 8k. The colored solve dispatches `n_iters × n_colors` kernels per frame, and `n_colors` is roughly constant for a stacked grid (each box contacts a bounded number of neighbours, so the conflict graph's chromatic number does not grow with body count). It is therefore **kernel-launch-bound** through 4k and only becomes compute-bound by 8k — the opposite of the old single-work-item solver, which scaled linearly with contact count. This flat region is exactly where GPU parallelism pays off.
+- **`build_and_query` (BVH build + level-synchronised refit + traversal) is the clear #2 cost** and grows roughly linearly with body count; it is the next target for higher body counts.
+- **`sort_pairs` is *not* the bottleneck** (6–8 %), even at 85 000 pairs where it falls back to the multi-launch bitonic path (Issue 2a, §13). That known issue is far less urgent in practice than its historical 77 %-of-frame profile suggested — the broadphase work since (single-kernel sort for n ≤ 1024, fp16 AABBs) and the now-parallel solver moved the bottleneck elsewhere.
+- The capacity-sensitive buffers (broadphase pairs, narrowphase contacts, solver lambda accumulator) scale with body count; the solver's `lambda_c_` must be sized to the maximum contact count (a default 16 384 overflows past ~16k contacts).
+
+### 9.5 Optimisation history — the migrating bottleneck
+
+GPU performance was reached by a sequence of targeted passes, each of which moved the dominant cost to the next stage rather than uniformly speeding everything up. Recording the progression matters because it shows *where* the bottleneck lived at each step and why the next change was the right one — the same single-frame profile that once read "77 % sort" now reads "68 % solver."
+
+| Stage of the work | Dominant cost (CUDA) | Change made | Result |
+|---|---|---|---|
+| Phase 5.5 (512 bodies) | broadphase `sort_pairs` — **77 %** of frame | Single-work-group bitonic sort (all bitonic passes in one kernel for n ≤ 1024) + fp16 BVH AABBs | sort 4.26 ms → ~0.1 ms; sort drops to ~3 % |
+| Re-profile (1 025 bodies) | **narrowphase 47 % + solver 46 %** — both single-work-item kernels | — (diagnosis) | bottleneck split between the two remaining serial passes |
+| Narrowphase parallelised | narrowphase ~9.4 ms (single work-item) | One work-item per candidate pair → scratch-append → key-sort → gather (reproduces sequential contact order, so determinism holds) | ~9.4 → ~1 ms; **~55 → ~101 fps** warm |
+| Solver parallelised + refit fixed | **XPBD solver ~9 ms** (single work-item, ~46 %) | Graph-colored parallel solve (§4.5.1) + level-synchronised deterministic BVH refit (§4.6) | **~101 → ~233 fps** warm; GPU beats the CPU for the first time; CUDA determinism restored at scale |
+| Multi-scale profile (this report, §9.4) | colored solver 64–77 %, but **launch-bound and near-flat** through 4k | — (diagnosis) | next target is `build_and_query` (BVH build/refit/traversal), which now scales ~linearly; `sort_pairs` is no longer material |
+
+Two structural lessons hold across the sequence. First, **every "fix" relocates the bottleneck** — there is no single hot spot, only a current one — so profiling has to be repeated after each change rather than trusted from a stale table. Second, **determinism was preserved at each step, not bolted on afterward**: the parallel narrowphase reproduces the sequential contact order via key-sort, the colored solver is deterministic by construction (fixed colour order, disjoint writes), and the level-synchronised refit reads only previously-finalised data — so the CI determinism gate held green through the entire optimisation, including at 4k/8k (§9.3).
 
 ---
 

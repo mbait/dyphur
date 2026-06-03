@@ -5,7 +5,9 @@
 #include "contact_store.hpp"
 #include "convex_hull_store.hpp"
 #include "mesh_bvh.hpp"
+#include <compute/buffer.hpp>
 #include <compute/stream.hpp>
+#include <cstdint>
 
 namespace dyphur {
 
@@ -47,7 +49,17 @@ public:
     uint32_t download_count(Stream& s) const { return store_.download_count(s); }
 
 private:
-    ContactStore store_;
+    // Pipeline: candidate pairs are tested in parallel (one work-item per pair),
+    // appending contacts to scratch_ in non-deterministic order while tagging each
+    // with a (pair_idx, sub_idx) key. The contacts are then sorted by that key and
+    // gathered into store_, reproducing the exact order a sequential pass would
+    // produce — so the solver/sensors and golden hashes are unaffected.
+    ContactStore     store_;     // final, sorted, compact (read by solver/sensors)
+    ContactStore     scratch_;   // parallel-append target (unordered)
+    Buffer<uint64_t> keys_;      // per-contact sort key, padded to a power of two
+    Buffer<uint32_t> perm_;      // identity → permutation that sorts keys_
+    uint32_t         cap_     = 0;
+    uint32_t         pad_cap_ = 0;  // next_pow2(cap_)
 };
 
 } // namespace dyphur

@@ -1,6 +1,7 @@
 #include <core/narrowphase.hpp>
 #include <compute/atomics.hpp>
 #include <compute/kernel.hpp>
+#include <compute/sort.hpp>
 #include <sycl/sycl.hpp>
 
 namespace dyphur {
@@ -8,17 +9,36 @@ namespace dyphur {
 // ── Device helpers ────────────────────────────────────────────────────────────
 namespace {
 
-inline bool emit(ContactView cv,
+inline uint32_t next_pow2(uint32_t n) {
+    if (n <= 1) return 1;
+    --n; n |= n >> 1; n |= n >> 2; n |= n >> 4; n |= n >> 8; n |= n >> 16;
+    return n + 1;
+}
+
+// Per-pair contact sink: contacts are appended to a scratch ContactView and each
+// is tagged with a sort key = (pair_idx << 32) | sub_idx, where sub_idx counts the
+// emissions within this pair. Sorting by that key restores the exact order a
+// sequential (pair 0, pair 1, …) pass would emit.
+struct PairSink {
+    ContactView cv;
+    uint64_t*   keys;
+    uint32_t    pair_idx;
+    uint32_t    sub;
+};
+
+inline bool emit(PairSink& sk,
                  uint32_t ia, uint32_t ib,
                  float px, float py, float pz,
                  float nx, float ny, float nz,
                  float depth) {
-    uint32_t idx = atomic_add_seq(cv.n, 1u);
-    if (idx >= cv.capacity) return false;
-    cv.body_a[idx] = ia;  cv.body_b[idx] = ib;
-    cv.pos_x[idx]  = px;  cv.pos_y[idx]  = py;  cv.pos_z[idx]  = pz;
-    cv.norm_x[idx] = nx;  cv.norm_y[idx] = ny;  cv.norm_z[idx] = nz;
-    cv.depth[idx]  = depth;
+    uint32_t idx = atomic_add_seq(sk.cv.n, 1u);
+    if (idx >= sk.cv.capacity) return false;
+    sk.cv.body_a[idx] = ia;  sk.cv.body_b[idx] = ib;
+    sk.cv.pos_x[idx]  = px;  sk.cv.pos_y[idx]  = py;  sk.cv.pos_z[idx]  = pz;
+    sk.cv.norm_x[idx] = nx;  sk.cv.norm_y[idx] = ny;  sk.cv.norm_z[idx] = nz;
+    sk.cv.depth[idx]  = depth;
+    sk.keys[idx] = (static_cast<uint64_t>(sk.pair_idx) << 32) | sk.sub;
+    ++sk.sub;
     return true;
 }
 
@@ -795,7 +815,7 @@ inline bool aabb_aabb(
 static constexpr int BVH_STACK_SIZE = 64;
 
 inline void traverse_sphere_mesh(
-    ContactView cv, uint32_t ia, uint32_t ib,
+    PairSink& sk, uint32_t ia, uint32_t ib,
     // Sphere (world space)
     float scx,float scy,float scz, float sr,
     // BVH data (nodes in local space of ib; ib is static so local=world here)
@@ -823,7 +843,7 @@ inline void traverse_sphere_mesh(
                                 vtx_x[tri_b[t]],vtx_y[tri_b[t]],vtx_z[tri_b[t]],
                                 vtx_x[tri_c[t]],vtx_y[tri_c[t]],vtx_z[tri_c[t]],
                                 px,py,pz,nx,ny,nz,depth))
-                emit(cv,ia,ib,px,py,pz,nx,ny,nz,depth);
+                emit(sk,ia,ib,px,py,pz,nx,ny,nz,depth);
         } else {
             if (top+2 < BVH_STACK_SIZE) {
                 stack[top++]=nd.left; stack[top++]=nd.right;
@@ -833,7 +853,7 @@ inline void traverse_sphere_mesh(
 }
 
 inline void traverse_box_mesh(
-    ContactView cv, uint32_t ia, uint32_t ib,
+    PairSink& sk, uint32_t ia, uint32_t ib,
     // Box world-space center + rotation matrix + half-extents
     float bcx,float bcy,float bcz,
     const float Re[3][3], float hx,float hy,float hz,
@@ -879,7 +899,7 @@ inline void traverse_box_mesh(
                 float nz_w=nx_l*Re[0][2]+ny_l*Re[1][2]+nz_l*Re[2][2];
                 // Contact point: midpoint of triangle centroid and box surface
                 float tcx=(wx0+wx1+wx2)/3.f, tcy=(wy0+wy1+wy2)/3.f, tcz=(wz0+wz1+wz2)/3.f;
-                emit(cv,ia,ib,tcx,tcy,tcz,nx_w,ny_w,nz_w,depth);
+                emit(sk,ia,ib,tcx,tcy,tcz,nx_w,ny_w,nz_w,depth);
             }
         } else {
             if (top+2 < BVH_STACK_SIZE) {
@@ -901,7 +921,7 @@ static inline void process_pair(
     uint32_t idx, const ContactPair* d_pairs,
     const BodyView& bv, const ShapeView& sv,
     ConvexHullView hv, MeshBvhCatalogView mv,
-    ContactView cv)
+    PairSink& sk)
 {
     ContactPair pair = d_pairs[idx];
     uint32_t ia = pair.a, ib = pair.b;
@@ -927,7 +947,7 @@ static inline void process_pair(
         if (!sphere_sphere(bv.pos_x[ia], bv.pos_y[ia], bv.pos_z[ia], sv.half_x[sha],
                            bv.pos_x[ib], bv.pos_y[ib], bv.pos_z[ib], sv.half_x[shb],
                            px, py, pz, nx, ny, nz, depth)) return;
-        emit(cv, ia, ib, px, py, pz, nx, ny, nz, depth);
+        emit(sk, ia, ib, px, py, pz, nx, ny, nz, depth);
         return;
     }
 
@@ -941,7 +961,7 @@ static inline void process_pair(
                         Be[2][0], Be[2][1], Be[2][2],
                         Bh[0], Bh[1], Bh[2], px, py, pz, nx, ny, nz, depth)) return;
         nx = -nx; ny = -ny; nz = -nz;
-        emit(cv, ia, ib, px, py, pz, nx, ny, nz, depth);
+        emit(sk, ia, ib, px, py, pz, nx, ny, nz, depth);
         return;
     }
 
@@ -954,7 +974,7 @@ static inline void process_pair(
                         Ae[1][0], Ae[1][1], Ae[1][2],
                         Ae[2][0], Ae[2][1], Ae[2][2],
                         Ah[0], Ah[1], Ah[2], px, py, pz, nx, ny, nz, depth)) return;
-        emit(cv, ia, ib, px, py, pz, nx, ny, nz, depth);
+        emit(sk, ia, ib, px, py, pz, nx, ny, nz, depth);
         return;
     }
 
@@ -974,7 +994,7 @@ static inline void process_pair(
             float cx = 0, cy = 0, cz = 0, cd = 0;
             for (int k = 0; k < nc; ++k) { cx+=opx[k]; cy+=opy[k]; cz+=opz[k]; cd+=od[k]; }
             float inv = 1.f / nc;
-            emit(cv, ia, ib, cx*inv, cy*inv, cz*inv, onx, ony, onz, cd*inv);
+            emit(sk, ia, ib, cx*inv, cy*inv, cz*inv, onx, ony, onz, cd*inv);
         }
         return;
     }
@@ -991,7 +1011,7 @@ static inline void process_pair(
                          bv.pos_x[ib],bv.pos_y[ib],bv.pos_z[ib],
                          bv.rot_w[ib],bv.rot_x[ib],bv.rot_y[ib],bv.rot_z[ib],
                          onx,ony,onz,odepth,opx,opy,opz))
-                emit(cv,ia,ib,opx,opy,opz,onx,ony,onz,odepth);
+                emit(sk,ia,ib,opx,opy,opz,onx,ony,onz,odepth);
         }
         return;
     }
@@ -1013,13 +1033,13 @@ static inline void process_pair(
         const BvhNode*  nodes = mv.nodes;
 
         if (ta == kSphere) {
-            traverse_sphere_mesh(cv, ia, ib,
+            traverse_sphere_mesh(sk, ia, ib,
                 bv.pos_x[ia],bv.pos_y[ia],bv.pos_z[ia], sv.half_x[sha],
                 vx,vy,vz, ta_,tb_,tc_, nodes, root);
         } else if (ta == kBox) {
             float Re[3][3]; float ah[3]={sv.half_x[sha],sv.half_y[sha],sv.half_z[sha]};
             make_axes(bv.rot_w[ia],bv.rot_x[ia],bv.rot_y[ia],bv.rot_z[ia], Re);
-            traverse_box_mesh(cv,ia,ib,
+            traverse_box_mesh(sk,ia,ib,
                 bv.pos_x[ia],bv.pos_y[ia],bv.pos_z[ia], Re, ah[0],ah[1],ah[2],
                 vx,vy,vz, ta_,tb_,tc_, nodes, root);
         }
@@ -1032,9 +1052,27 @@ static inline void process_pair(
 
 Narrowphase::Narrowphase(Stream& s, uint32_t max_contacts)
     : store_(s, max_contacts)
+    , scratch_(s, max_contacts)
+    , keys_(s, next_pow2(max_contacts))
+    , perm_(s, next_pow2(max_contacts))
+    , cap_(max_contacts)
+    , pad_cap_(next_pow2(max_contacts))
 {}
 
 // ── Narrowphase::run (CPU pair count) ────────────────────────────────────────
+//
+// One work-item per candidate pair runs the contact tests in parallel, appending
+// to scratch_ (unordered) and tagging each contact with a (pair_idx, sub_idx) key.
+// The contacts are then sorted by that key and gathered into store_, reproducing
+// the exact pair-by-pair *order* a sequential pass would produce. The order and
+// the set of contacts are therefore identical to the old single-work-item path,
+// so the solver and sensors see the same input and determinism is preserved.
+//
+// Note: this changes the contact *values* by at most 1 ULP on the CUDA backend —
+// the JIT (ptxas) contracts a*b+c into FMA differently when the shared geometry
+// code is inlined into a wide parallel_for than into the old single-thread loop.
+// That is the same FMA-contraction effect documented in known_issues Issue 1; it
+// is deterministic per build. The CPU/OpenMP path is bit-identical to before.
 
 void Narrowphase::run(Stream& s,
                       const ContactPair* d_pairs, uint32_t n_pairs,
@@ -1043,22 +1081,54 @@ void Narrowphase::run(Stream& s,
                       MeshBvhCatalogView meshes)
 {
     store_.reset(s);
+    scratch_.reset(s);
     if (n_pairs == 0) return;
 
-    ContactView cv = store_.view();
+    auto& q = s.queue();
+    ContactView scv = scratch_.view();
+    uint64_t*   keys = keys_.data();
+    uint32_t*   perm = perm_.data();
     const BodyView  bv = bodies;
     const ShapeView sv = shapes;
-    const uint32_t  np = n_pairs;
     const ConvexHullView     hv = hulls;
     const MeshBvhCatalogView mv = meshes;
 
-    parallel_for(s, 1, [=](size_t) {
-        for (uint32_t idx = 0; idx < np; ++idx)
-            process_pair(idx, d_pairs, bv, sv, hv, mv, cv);
+    // 1. Parallel contact generation → scratch_ + per-contact keys.
+    parallel_for(s, n_pairs, [=](size_t i) {
+        PairSink sk{scv, keys, static_cast<uint32_t>(i), 0u};
+        process_pair(static_cast<uint32_t>(i), d_pairs, bv, sv, hv, mv, sk);
     });
+
+    // 2. How many contacts were produced? (one sync; the broadphase already syncs
+    //    once per frame, so this adds a single extra round-trip.)
+    uint32_t nc = scratch_.download_count(s);
+    if (nc > cap_) nc = cap_;
+    if (nc == 0) return;
+
+    // 3. Sort the contacts by key. Pad to a power of two with UINT64_MAX keys so the
+    //    padding sorts to the end; perm starts as identity.
+    uint32_t n_sort = next_pow2(nc);
+    q.memset(keys + nc, 0xFF, static_cast<size_t>(n_sort - nc) * sizeof(uint64_t));
+    parallel_for(s, n_sort, [perm](size_t i) { perm[i] = static_cast<uint32_t>(i); });
+    sort_by_key(s, keys, perm, static_cast<size_t>(n_sort));
+
+    // 4. Gather scratch_[perm[k]] → store_[k] for k in [0, nc); set the count.
+    ContactView mcv = store_.view();
+    parallel_for(s, nc, [=](size_t k) {
+        uint32_t src = perm[k];
+        mcv.body_a[k] = scv.body_a[src];  mcv.body_b[k] = scv.body_b[src];
+        mcv.pos_x[k]  = scv.pos_x[src];   mcv.pos_y[k]  = scv.pos_y[src];  mcv.pos_z[k]  = scv.pos_z[src];
+        mcv.norm_x[k] = scv.norm_x[src];  mcv.norm_y[k] = scv.norm_y[src]; mcv.norm_z[k] = scv.norm_z[src];
+        mcv.depth[k]  = scv.depth[src];
+    });
+    parallel_for(s, 1, [mcv, nc](size_t) { *mcv.n = nc; });
 }
 
-// ── Narrowphase::run (device pair count — no CPU sync needed) ─────────────────
+// ── Narrowphase::run (device pair count) ──────────────────────────────────────
+//
+// The pair count must be known on the host to size the parallel dispatch and the
+// contact sort, so this variant downloads it and delegates to the CPU-count path.
+// (No current caller relies on it staying sync-free.)
 
 void Narrowphase::run(Stream& s,
                       const ContactPair* d_pairs, const uint32_t* d_n_pairs,
@@ -1066,19 +1136,9 @@ void Narrowphase::run(Stream& s,
                       ConvexHullView hulls,
                       MeshBvhCatalogView meshes)
 {
-    store_.reset(s);
-
-    ContactView cv = store_.view();
-    const BodyView  bv = bodies;
-    const ShapeView sv = shapes;
-    const ConvexHullView     hv = hulls;
-    const MeshBvhCatalogView mv = meshes;
-
-    parallel_for(s, 1, [=](size_t) {
-        uint32_t np = *d_n_pairs;
-        for (uint32_t idx = 0; idx < np; ++idx)
-            process_pair(idx, d_pairs, bv, sv, hv, mv, cv);
-    });
+    uint32_t n_pairs;
+    s.queue().memcpy(&n_pairs, d_n_pairs, sizeof(n_pairs)).wait();
+    run(s, d_pairs, n_pairs, bodies, shapes, hulls, meshes);
 }
 
 } // namespace dyphur

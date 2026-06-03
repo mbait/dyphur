@@ -24,6 +24,9 @@ constexpr int NX = 2, NZ = 2, NY = 2;
 constexpr int N_DYN = NX * NY * NZ;   // 8
 constexpr int N_BODIES = N_DYN + 1;   // +1 static ground
 constexpr float BOX_H = 0.4f;
+// Large-scene case: enough contacts (> XpbdSolver::kSerialThreshold) to exercise
+// the graph-colored parallel solver + the deep level-synchronised BVH refit.
+constexpr int LG_NX = 8, LG_NZ = 8, LG_NY = 4;   // 256 dynamic + ground
 constexpr float GND_HY = 0.5f, GND_HX = 5.f;
 constexpr float DT = 1.f / 60.f;
 constexpr int N_FRAMES = 20;
@@ -35,9 +38,12 @@ static uint64_t fnv1a64(uint64_t h, const void* data, size_t n) {
     return h;
 }
 
-static uint64_t run_sim(Device& dev) {
+static uint64_t run_box_sim(Device& dev, int nx, int ny, int nz) {
     auto s  = dev.make_stream();
     auto& q = s.queue();
+
+    const int n_dyn    = nx * ny * nz;
+    const int n_bodies = n_dyn + 1;
 
     ShapeStore ss(s, 4);
     ShapeParams dsp;
@@ -48,19 +54,19 @@ static uint64_t run_sim(Device& dev) {
     uint32_t gs = ss.add(gsp);
     ss.upload();
 
-    BodyStore bs(s, N_BODIES);
+    BodyStore bs(s, n_bodies);
     const float m = 1.f, Idiag = m / 3.f * 2.f * BOX_H * BOX_H;
     BodyParams dp;
     dp.mass = m;
     dp.inertia = Mat3f(Idiag, 0, 0, 0, Idiag, 0, 0, 0, Idiag);
     dp.shape_handle = ds;
     dp.flags = 0;
-    for (int iy = 0; iy < NY; ++iy)
-        for (int ix = 0; ix < NX; ++ix)
-            for (int iz = 0; iz < NZ; ++iz) {
-                dp.position = { (ix - NX/2 + 0.5f) * 1.f,
+    for (int iy = 0; iy < ny; ++iy)
+        for (int ix = 0; ix < nx; ++ix)
+            for (int iz = 0; iz < nz; ++iz) {
+                dp.position = { (ix - nx/2 + 0.5f) * 1.f,
                                 GND_HY + (iy + 1) * 1.f,
-                                (iz - NZ/2 + 0.5f) * 1.f };
+                                (iz - nz/2 + 0.5f) * 1.f };
                 bs.add(dp);
             }
     BodyParams gp;
@@ -69,15 +75,17 @@ static uint64_t run_sim(Device& dev) {
     bs.add(gp);
     bs.upload(); s.wait();
 
-    Broadphase  bp(s, N_BODIES, 4096u);
-    Narrowphase np(s, 1024u);
+    // Capacities scale with body count; generous enough for stacked grids.
+    const uint32_t pair_cap = static_cast<uint32_t>(n_bodies) * 32u + 256u;
+    Broadphase  bp(s, n_bodies, pair_cap);
+    Narrowphase np(s, pair_cap);
     XpbdSolver  solver(s, 10);
 
     IntegratorParams ip;
     ip.gravity = {0, -9.81f, 0}; ip.dt = DT; ip.n_substeps = 1;
 
     BodyView bv = bs.view(); ShapeView sv = ss.view();
-    const AABB bounds = {-10, -2, -10, 10, 15, 10};
+    const AABB bounds = {-20, -2, -20, 20, 30, 20};
 
     for (int f = 0; f < N_FRAMES; ++f) {
         integrate(s, bv, ip);
@@ -89,26 +97,28 @@ static uint64_t run_sim(Device& dev) {
     }
     s.wait();
 
-    std::vector<float> hx(N_BODIES), hy(N_BODIES), hz(N_BODIES);
-    std::vector<float> hw(N_BODIES), hqx(N_BODIES), hqy(N_BODIES), hqz(N_BODIES);
-    q.memcpy(hx.data(),  bv.pos_x, N_BODIES * sizeof(float));
-    q.memcpy(hy.data(),  bv.pos_y, N_BODIES * sizeof(float));
-    q.memcpy(hz.data(),  bv.pos_z, N_BODIES * sizeof(float));
-    q.memcpy(hw.data(),  bv.rot_w, N_BODIES * sizeof(float));
-    q.memcpy(hqx.data(), bv.rot_x, N_BODIES * sizeof(float));
-    q.memcpy(hqy.data(), bv.rot_y, N_BODIES * sizeof(float));
-    q.memcpy(hqz.data(), bv.rot_z, N_BODIES * sizeof(float)).wait();
+    std::vector<float> hx(n_bodies), hy(n_bodies), hz(n_bodies);
+    std::vector<float> hw(n_bodies), hqx(n_bodies), hqy(n_bodies), hqz(n_bodies);
+    q.memcpy(hx.data(),  bv.pos_x, n_bodies * sizeof(float));
+    q.memcpy(hy.data(),  bv.pos_y, n_bodies * sizeof(float));
+    q.memcpy(hz.data(),  bv.pos_z, n_bodies * sizeof(float));
+    q.memcpy(hw.data(),  bv.rot_w, n_bodies * sizeof(float));
+    q.memcpy(hqx.data(), bv.rot_x, n_bodies * sizeof(float));
+    q.memcpy(hqy.data(), bv.rot_y, n_bodies * sizeof(float));
+    q.memcpy(hqz.data(), bv.rot_z, n_bodies * sizeof(float)).wait();
 
     uint64_t h = FNV_OFFSET;
-    h = fnv1a64(h, hx.data(),  N_BODIES * sizeof(float));
-    h = fnv1a64(h, hy.data(),  N_BODIES * sizeof(float));
-    h = fnv1a64(h, hz.data(),  N_BODIES * sizeof(float));
-    h = fnv1a64(h, hw.data(),  N_BODIES * sizeof(float));
-    h = fnv1a64(h, hqx.data(), N_BODIES * sizeof(float));
-    h = fnv1a64(h, hqy.data(), N_BODIES * sizeof(float));
-    h = fnv1a64(h, hqz.data(), N_BODIES * sizeof(float));
+    h = fnv1a64(h, hx.data(),  n_bodies * sizeof(float));
+    h = fnv1a64(h, hy.data(),  n_bodies * sizeof(float));
+    h = fnv1a64(h, hz.data(),  n_bodies * sizeof(float));
+    h = fnv1a64(h, hw.data(),  n_bodies * sizeof(float));
+    h = fnv1a64(h, hqx.data(), n_bodies * sizeof(float));
+    h = fnv1a64(h, hqy.data(), n_bodies * sizeof(float));
+    h = fnv1a64(h, hqz.data(), n_bodies * sizeof(float));
     return h;
 }
+
+static uint64_t run_sim(Device& dev) { return run_box_sim(dev, NX, NY, NZ); }
 
 } // namespace
 
@@ -208,7 +218,7 @@ static uint64_t run_artic_sim(Device& dev) {
 #if defined(DYPHUR_BACKEND_IS_CUDA)
 // CUDA build (CPU path compiled by CUDA-capable clang)
 constexpr uint64_t GOLDEN_BOX   = 0xfb43a5a0352e1fe8ULL;
-constexpr uint64_t GOLDEN_ARTIC = 0x7c0a8166eb564f41ULL;  // updated: XPBD static friction
+constexpr uint64_t GOLDEN_ARTIC = 0x751ebe6959a2507cULL;  // updated: static-body write guards
 #else
 // OMP / CPU-only build
 constexpr uint64_t GOLDEN_BOX   = 0xcbcd209c3665c818ULL;
@@ -228,6 +238,21 @@ TEST_CASE("sim determinism: 8 boxes + ground, 20 frames", "[determinism]") {
         INFO("hash=0x" << std::hex << h1 << " golden=0x" << GOLDEN_BOX);
         REQUIRE(h1 == GOLDEN_BOX);
     }
+}
+
+// Large stacked grid: > kSerialThreshold contacts ⇒ exercises the graph-colored
+// parallel solver and the deep level-synchronised BVH refit. This is the case that
+// actually gates the coloring path and Issue 4 (the small scenes above are serial /
+// shallow). We assert run-to-run consistency rather than a fixed golden, since the
+// trajectory value is not the point — determinism under parallelism is.
+TEST_CASE("sim determinism: 256-box stack (colored solver), 20 frames", "[determinism]") {
+    Device dev = Device::default_cpu();
+
+    uint64_t h1 = run_box_sim(dev, LG_NX, LG_NY, LG_NZ);
+    uint64_t h2 = run_box_sim(dev, LG_NX, LG_NY, LG_NZ);
+
+    INFO("large hash=0x" << std::hex << h1);
+    REQUIRE(h1 == h2);
 }
 
 TEST_CASE("sim determinism: 2-link articulated arm, 20 frames", "[determinism]") {

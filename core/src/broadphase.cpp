@@ -196,12 +196,19 @@ void Broadphase::build_and_query(Stream&         s,
         });
     }
 
-    // ── Step 6: Refit — bottom-up AABB propagation ───────────────────────────
-    // Each leaf computes its body's AABB, stores it, then walks up using
-    // seq_cst atomics for the acquire-release synchronisation with siblings.
+    // ── Step 6: Refit — bottom-up AABB propagation (level-synchronised) ───────
+    // A parallel refit must not have one thread read a child AABB another thread
+    // is still writing — CUDA's device-scope atomics don't reliably order the
+    // non-atomic fp16 AABB writes against the rendezvous flag, which made the old
+    // atomic-walk-up refit non-deterministic at scale (known_issues Issue 4).
+    // Instead: (a) a parallel pass computes every leaf AABB; (b) repeated rounds,
+    // each a *separate* queue-ordered kernel, merge an internal node once both its
+    // children are finalised. Because a parent always reads child AABBs that were
+    // written by a *previous* kernel, the reads are ordered and the result is
+    // bit-identical every run. `d_flags_` (zeroed in Step 3) doubles as the
+    // per-internal-node "finalised" flag; leaves (index ≥ n_int-1) are always ready.
     {
         const uint32_t* d_si   = d_sorted_idx_.data();
-        const int32_t*  d_par  = d_parent_.data();
         const int32_t*  d_lft  = d_left_.data();
         const int32_t*  d_rgt  = d_right_.data();
         sycl::half* d_mn_x = d_aabb_min_x_.data();
@@ -213,31 +220,22 @@ void Broadphase::build_and_query(Stream&         s,
         uint32_t* d_flags = d_flags_.data();
         const BodyView  bv = bodies;
         const ShapeView sv = shapes;
+        const int ni = n_int;
 
+        // (a) Parallel leaf AABBs.
         parallel_for(s, static_cast<size_t>(n_int), [=](size_t leaf_k) {
             uint32_t body = d_si[leaf_k];
-
-            // Compute AABB for this body's shape (fp32).
-            float px = bv.pos_x[body];
-            float py = bv.pos_y[body];
-            float pz = bv.pos_z[body];
-            uint32_t sh    = bv.shape[body];
-            uint32_t stype = sv.type[sh];
+            float px = bv.pos_x[body], py = bv.pos_y[body], pz = bv.pos_z[body];
+            uint32_t sh = bv.shape[body], stype = sv.type[sh];
             float hx = sv.half_x[sh];
-
             float mn_x, mn_y, mn_z, mx_x, mx_y, mx_z;
-
             if (stype == static_cast<uint32_t>(ShapeType::Sphere)) {
                 mn_x = px - hx; mx_x = px + hx;
                 mn_y = py - hx; mx_y = py + hx;
                 mn_z = pz - hx; mx_z = pz + hx;
             } else { // Box
-                float qw = bv.rot_w[body];
-                float qx = bv.rot_x[body];
-                float qy = bv.rot_y[body];
-                float qz = bv.rot_z[body];
-                float hy = sv.half_y[sh];
-                float hz = sv.half_z[sh];
+                float qw = bv.rot_w[body], qx = bv.rot_x[body], qy = bv.rot_y[body], qz = bv.rot_z[body];
+                float hy = sv.half_y[sh], hz = sv.half_z[sh];
                 float rxx = 1.f - 2.f*(qy*qy + qz*qz);
                 float rxy =        2.f*(qx*qy - qz*qw);
                 float rxz =        2.f*(qx*qz + qy*qw);
@@ -254,38 +252,47 @@ void Broadphase::build_and_query(Stream&         s,
                 mn_y = py - ey; mx_y = py + ey;
                 mn_z = pz - ez; mx_z = pz + ez;
             }
-
-            // Store leaf AABB as fp16 (leaf k occupies node n-1+k).
-            // Min bounds shrink slightly, max bounds grow slightly on conversion.
-            // The narrowphase is the authoritative contact check.
-            int nidx = n_int - 1 + static_cast<int>(leaf_k);
+            int nidx = ni - 1 + static_cast<int>(leaf_k);
             d_mn_x[nidx] = sycl::half(mn_x);  d_mx_x[nidx] = sycl::half(mx_x);
             d_mn_y[nidx] = sycl::half(mn_y);  d_mx_y[nidx] = sycl::half(mx_y);
             d_mn_z[nidx] = sycl::half(mn_z);  d_mx_z[nidx] = sycl::half(mx_z);
+        });
 
-            // Propagate upward, merging fp16 AABB values via fp32 arithmetic.
-            int cur = nidx;
-            while (true) {
-                int p = d_par[cur];
-                if (p < 0) break;
-                // seq_cst fetch_add: ensures previous AABB writes are visible
-                // to the sibling that observes old==1.
-                uint32_t old = atomic_add_seq(d_flags + p, 1u);
-                if (old == 0u) break;
-                // Second sibling: merge children (load fp16 → merge as fp32 → store fp16).
-                int lc = d_lft[p], rc = d_rgt[p];
-                float pmnx = float(d_mn_x[lc]) < float(d_mn_x[rc]) ? float(d_mn_x[lc]) : float(d_mn_x[rc]);
-                float pmny = float(d_mn_y[lc]) < float(d_mn_y[rc]) ? float(d_mn_y[lc]) : float(d_mn_y[rc]);
-                float pmnz = float(d_mn_z[lc]) < float(d_mn_z[rc]) ? float(d_mn_z[lc]) : float(d_mn_z[rc]);
-                float pmxx = float(d_mx_x[lc]) > float(d_mx_x[rc]) ? float(d_mx_x[lc]) : float(d_mx_x[rc]);
-                float pmxy = float(d_mx_y[lc]) > float(d_mx_y[rc]) ? float(d_mx_y[lc]) : float(d_mx_y[rc]);
-                float pmxz = float(d_mx_z[lc]) > float(d_mx_z[rc]) ? float(d_mx_z[lc]) : float(d_mx_z[rc]);
-                d_mn_x[p] = sycl::half(pmnx);  d_mx_x[p] = sycl::half(pmxx);
-                d_mn_y[p] = sycl::half(pmny);  d_mx_y[p] = sycl::half(pmxy);
-                d_mn_z[p] = sycl::half(pmnz);  d_mx_z[p] = sycl::half(pmxz);
-                cur = p;
+        // (b) Level-synchronised merge rounds. One kernel per round; a node merges
+        // only once both children are finalised (children come from prior kernels).
+        // The Karras tree over distinct 64-bit keys has height ≤ 64, so ≤ 64 rounds
+        // always complete it; we run in batches and stop once the root is finalised.
+        if (n_int > 1) {
+            int32_t root_h;
+            q.memcpy(&root_h, d_root_.data(), sizeof(int32_t)).wait();
+            const size_t n_internal = static_cast<size_t>(n_int - 1);
+            constexpr int BATCH = 16, MAX_BATCH = 4;   // 64 rounds max
+            for (int batch = 0; batch < MAX_BATCH; ++batch) {
+                for (int r = 0; r < BATCH; ++r) {
+                    parallel_for(s, n_internal, [=](size_t pp) {
+                        int p = static_cast<int>(pp);
+                        if (d_flags[p]) return;                 // already finalised
+                        int lc = d_lft[p], rc = d_rgt[p];
+                        bool lready = (lc >= ni - 1) || d_flags[lc];
+                        bool rready = (rc >= ni - 1) || d_flags[rc];
+                        if (!lready || !rready) return;
+                        float pmnx = sycl::fmin(float(d_mn_x[lc]), float(d_mn_x[rc]));
+                        float pmny = sycl::fmin(float(d_mn_y[lc]), float(d_mn_y[rc]));
+                        float pmnz = sycl::fmin(float(d_mn_z[lc]), float(d_mn_z[rc]));
+                        float pmxx = sycl::fmax(float(d_mx_x[lc]), float(d_mx_x[rc]));
+                        float pmxy = sycl::fmax(float(d_mx_y[lc]), float(d_mx_y[rc]));
+                        float pmxz = sycl::fmax(float(d_mx_z[lc]), float(d_mx_z[rc]));
+                        d_mn_x[p] = sycl::half(pmnx);  d_mx_x[p] = sycl::half(pmxx);
+                        d_mn_y[p] = sycl::half(pmny);  d_mx_y[p] = sycl::half(pmxy);
+                        d_mn_z[p] = sycl::half(pmnz);  d_mx_z[p] = sycl::half(pmxz);
+                        d_flags[p] = 1u;
+                    });
+                }
+                uint32_t root_ready = 0;
+                q.memcpy(&root_ready, d_flags + root_h, sizeof(uint32_t)).wait();
+                if (root_ready) break;
             }
-        }); // end parallel refit
+        }
     }
 
     // ── Step 7: Traversal — emit overlapping candidate pairs ─────────────────

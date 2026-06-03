@@ -147,3 +147,84 @@ TEST_CASE("XpbdSolver: static body unmoved", "[solver][smoke]") {
     REQUIRE_THAT(y0, WithinAbs(0.f, kEps));   // static body unmoved
     REQUIRE(y1 >= 1.f - kEps);                 // dynamic body pushed up
 }
+
+// Coloring correctness: the graph-colored parallel path must agree with the
+// single-work-item serial oracle. We use N independent sphere pairs (no shared
+// body) — enough of them to exceed kSerialThreshold so the colored path engages,
+// but all assigned the same colour, so the two paths apply the *same* disjoint
+// constraints and must produce bit-identical body state. (Cross-colour Gauss-
+// Seidel ordering is exercised for determinism in sim_determinism_test.)
+TEST_CASE("XpbdSolver: colored path == serial oracle (independent pairs)",
+          "[solver]") {
+    constexpr uint32_t N_PAIRS  = 300;                       // > kSerialThreshold
+    constexpr uint32_t N_BODIES = N_PAIRS * 2;
+    static_assert(N_PAIRS > XpbdSolver::kSerialThreshold);
+
+    auto dev = Device::default_cpu();
+    auto s   = dev.make_stream();
+    auto& q  = s.queue();
+
+    ShapeStore ss(s, 1);
+    ShapeParams sp; sp.type = ShapeType::Sphere; sp.half_x = 0.5f;
+    ss.add(sp);
+    ss.upload();
+
+    // Each pair is widely separated from the others (Δy=10) so only the explicit
+    // (2k, 2k+1) pair overlaps — no accidental cross-pair contacts.
+    BodyStore bs(s, N_BODIES);
+    std::vector<float> init_y(N_BODIES);
+    BodyParams p; p.mass = 1.f; p.flags = 0;
+    for (uint32_t k = 0; k < N_PAIRS; ++k) {
+        float base = 10.f * static_cast<float>(k);
+        p.position = {0.f, base,        0.f}; init_y[2*k]   = base;        bs.add(p);
+        p.position = {0.f, base + 0.8f, 0.f}; init_y[2*k+1] = base + 0.8f; bs.add(p);
+    }
+    bs.upload(); s.wait();
+
+    std::vector<ContactPair> pairs(N_PAIRS);
+    for (uint32_t k = 0; k < N_PAIRS; ++k) pairs[k] = ContactPair{2*k, 2*k+1};
+    Buffer<ContactPair> pbuf(s, N_PAIRS);
+    pbuf.upload(pairs.data(), N_PAIRS);
+    s.wait();
+
+    Narrowphase np(s, N_PAIRS + 8);
+    np.run(s, pbuf.data(), N_PAIRS, bs.view(), ss.view());
+    s.wait();
+    REQUIRE(np.download_count(s) == N_PAIRS);   // each pair overlaps once
+
+    auto reset_bodies = [&]() {
+        q.memcpy(bs.view().pos_y, init_y.data(), N_BODIES * sizeof(float)).wait();
+    };
+    auto snapshot_y = [&]() {
+        std::vector<float> y(N_BODIES);
+        q.memcpy(y.data(), bs.view().pos_y, N_BODIES * sizeof(float)).wait();
+        return y;
+    };
+
+    // Colored path (default): n_con = 300 > threshold.
+    reset_bodies();
+    XpbdSolver colored(s, 10);
+    colored.solve(s, np.contacts(), JointView{}, bs.view(), 1.f/60.f);
+    s.wait();
+    auto y_colored = snapshot_y();
+
+    // Serial oracle on the identical initial state + identical contacts.
+    reset_bodies();
+    XpbdSolver serial(s, 10);
+    serial.set_force_serial(true);
+    serial.solve(s, np.contacts(), JointView{}, bs.view(), 1.f/60.f);
+    s.wait();
+    auto y_serial = snapshot_y();
+
+    // Disjoint constraints ⇒ order-independent ⇒ bit-for-bit identical.
+    for (uint32_t i = 0; i < N_BODIES; ++i)
+        REQUIRE(y_colored[i] == y_serial[i]);
+
+    // And the colored path is run-to-run deterministic.
+    reset_bodies();
+    colored.solve(s, np.contacts(), JointView{}, bs.view(), 1.f/60.f);
+    s.wait();
+    auto y_colored2 = snapshot_y();
+    for (uint32_t i = 0; i < N_BODIES; ++i)
+        REQUIRE(y_colored[i] == y_colored2[i]);
+}

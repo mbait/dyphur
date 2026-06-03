@@ -128,7 +128,7 @@ Sequential processing over the deterministic sorted pair list for reproducibilit
 
 ### 4.5 Solver — XPBD
 
-Extended Position-Based Dynamics (Müller et al. 2020). Sequential Gauss-Seidel over contacts, single GPU work-item for determinism.
+Extended Position-Based Dynamics (Müller et al. 2020). Gauss-Seidel over contacts and joints, parallelised on the GPU by **graph coloring** (§4.5.1).
 
 **Why XPBD over impulse-based LCP**: XPBD is GPU-natural (no global constraint matrix), naturally handles contact + joint constraints in a unified loop, and is simpler to implement correctly solo than a projected-Gauss-Seidel LCP solver. The tradeoff is that XPBD is not fully physically accurate for high-stiffness joints, but it is sufficient for manipulation simulation.
 
@@ -147,6 +147,20 @@ Full angular response: `I_world⁻¹ = R · I_body⁻¹ · Rᵀ`. Quaternions ar
 
 **Sleeping / energy dissipation**: zero-restitution velocity correction zeroes the normal relative velocity at contact (velocity-level constraint). Per-contact accumulated lambda prevents multi-iteration over-correction.
 
+#### 4.5.1 Parallelism — graph coloring
+
+The solve was originally a single GPU work-item processing all contacts sequentially (chosen for deterministic Gauss-Seidel ordering). At scale this became the dominant cost — ~3 765 contacts × 10 iterations on one of ~3 500 GPU cores — and was why the GPU lost to the CPU at every scene size.
+
+It is now parallelised by **graph coloring**, the approach used by NVIDIA Newton/Warp (`warp.sim.graph_coloring`) and PhysX 5 TGS. Constraints (contacts + joints) are partitioned into colours such that no two constraints in a colour share a *dynamic* body. Within a colour, work-items touch disjoint bodies, so the colour solves in one parallel kernel with **no atomics**; colours are dispatched in queue order, preserving Gauss-Seidel coupling *across* colours. This is **deterministic by construction** — fixed colour order, disjoint writes — so it satisfies the determinism gate, unlike a Jacobi/atomic sweep.
+
+Key design points:
+- **Static/kinematic bodies (`inv_mass == 0`) are not coloring nodes.** Their writes are guarded no-ops (`w·Δλ == 0`), so they never conflict; this keeps all 1 024 box↔ground contacts in a handful of colours instead of forcing ~1 024. (PhysX/Newton do exactly this.)
+- **Coloring** is a single-work-item greedy pass keyed on constraint index: each constraint takes the lowest colour not yet used by either of its dynamic bodies (a per-body 64-bit used-colour mask; spill → serial fallback if > 64 colours). Run once per frame, amortised over `n_iters` parallel sweeps.
+- **Quaternion renormalisation** moved to its own per-body parallel kernel (was per-iteration inside the serial kernel).
+- **Serial fallback** retained for scenes ≤ `kSerialThreshold` (256 constraints) — keeps small scenes / goldens unchanged — and as a determinism oracle (`set_force_serial`) cross-checked against the colored path in `xpbd_solver_test`.
+
+Result: `stress_test_blocks` (1 025 bodies) went ~101 → **~237 fps warm** on the RTX 3060, and the GPU now beats the OpenMP CPU (~205 fps) for the first time. Result hashes changed (colour order ≠ contact-index order); goldens were regenerated.
+
 ### 4.6 Determinism
 
 Determinism on the same hardware + build is a hard requirement, enforced by CI.
@@ -154,18 +168,20 @@ Determinism on the same hardware + build is a hard requirement, enforced by CI.
 Achieved by:
 1. **Stable Morton sort**: 64-bit key `(morton30 << 32) | body_idx` makes equal-Morton bodies sort by index → deterministic, distinct keys for the Karras radix tree every run.
 2. **Bitonic sort of broadphase pairs** by canonical `(a, b)` key → deterministic contact traversal order regardless of the order pairs were atomically appended.
-3. **Single-work-item narrowphase** over the sorted pair list.
-4. **Single-work-item XPBD** with fixed contact traversal order.
+3. **Narrowphase** parallelised via scratch-append + key-sort + gather, which reproduces the sequential pair/contact order (so the contact set and order are run-invariant).
+4. **XPBD solve** parallelised by **graph coloring** (§4.5.1): fixed colour order + disjoint per-colour writes ⇒ deterministic by construction, no atomics.
+5. **Level-synchronised BVH refit**: each merge round is a separate queue-ordered kernel, so a parent only ever reads child AABBs finalised by a *previous* kernel — no intra-kernel cross-thread read of in-flight data (this closed the former parallel-refit race, see below).
 
-The CI determinism gate (`test_core_sim_determinism`) covers two small scenes and passes bit-identically on both backends, every run.
+The CI determinism gate (`test_core_sim_determinism`) covers an 8-box scene, a 2-link arm, **and a 256-box stacked scene** (the large case exercises the colored solver and the deep BVH refit — the small scenes are serial/shallow and would not catch a coloring or refit race). It passes bit-identically on both backends, every run, and `stress_test_blocks` (1 025 bodies) now returns an identical hash across runs on CUDA (`3b31b708569886eb`).
 
-> **Caveat — parallel BVH refit (Phase 5.5).** The bottom-up AABB refit was changed from a single-work-item loop to a Karras 2012 *parallel* refit (`parallel_for` over leaves with an atomic-flag rendezvous) for performance. That refit reads a node's two child AABBs after an atomic counter signals both subtrees are done, but on CUDA the device-scope atomic does not reliably order the non-atomic AABB writes/reads against it — so at large scene sizes a child AABB can be read stale, producing a different broadphase result run to run. This is benign for shallow trees (small scenes stay deterministic) but makes `stress_test_blocks` (1 025 bodies) non-deterministic on CUDA. OpenMP is unaffected. See §9.3 and §13. (A single-work-item refit, or a correctly fenced parallel refit, restores full determinism at a perf cost.)
+> **Resolved — parallel BVH refit (was a CUDA-only race).** The Phase 5.5 parallel refit used a Karras atomic-flag rendezvous and read a node's two child AABBs once an atomic counter signalled both subtrees done; on CUDA the device-scope atomic did not reliably order the non-atomic fp16 AABB writes against the flag, so a deep tree could read a stale child AABB and diverge run to run. It is replaced (2026-06-03) by a **level-synchronised** refit: a parallel leaf-AABB pass, then merge rounds each dispatched as a *separate* queue-ordered kernel (a node merges once both children are finalised; `d_flags_` is the per-node ready flag, leaves implicitly ready). Parents read only previously-finalised children ⇒ bit-identical every run, still parallel (~237 fps vs ~177 for a single-work-item fallback). Rounds run in batches of 16, stopping once the root is finalised (Karras tree height ≤ 64 for distinct 64-bit keys).
 
 CPU and GPU hashes differ by design (different FP unit behaviour, FTZ on GPU). Same-backend, same-build determinism is the requirement.
 
 **Golden hashes** (Debug, physics-level determinism tests, current):
 - 8 boxes + ground, 20 frames — OMP `0xcbcd209c3665c818`, CUDA `0xfb43a5a0352e1fe8`
-- 2-link revolute arm, 20 frames — OMP `0x44d086af21f338cf`, CUDA `0x7c0a8166eb564f41`
+- 2-link revolute arm, 20 frames — OMP `0x44d086af21f338cf`, CUDA `0x751ebe6959a2507c`
+- 256-box stack (colored solver), 20 frames — run-to-run equality only (no fixed golden)
 
 ---
 
@@ -248,24 +264,24 @@ All figures below are measured on the reference hardware: **NVIDIA GeForce RTX 3
 
 | Backend | FPS | Realtime | Grasp OK | Run-to-run det. |
 |---|---|---|---|---|
-| CUDA (RTX 3060) | 128.5 | 2.14× | yes | yes (`35460c9aae037549`) |
+| CUDA (RTX 3060) | 159.7 | 2.66× | yes | yes (`a0230d602c378203`) |
 | OpenMP (4 threads) | 260.3 | 4.34× | yes | yes (`1f0d4116979b0ee9`) |
 
 **stress_test_blocks** — 1 025 rigid bodies (1 024 dynamic 0.4 m boxes stacked 8×8×16 + ground), ~3 400 contacts/frame, 300 frames (5 s).
 
 | Backend | FPS | Realtime | Run-to-run det. |
 |---|---|---|---|
-| CUDA (RTX 3060) | ~55 warm / ~36 cold | 0.92× | **NO** — see §9.3 |
+| CUDA (RTX 3060) | **~233 warm** / ~84 cold | 3.9× | yes (`3b31b708569886eb`) |
 | OpenMP (4 threads) | 205.5 | 3.42× | yes (`6ffbaef0a15d3e13`) |
 
 **arm_push** — SDF-loaded 1-DOF arm sweeping into 2 pushable boxes (5 bodies, 1 revolute joint, full contact pipeline), 600 frames.
 
 | Backend | FPS | Realtime | Run-to-run det. |
 |---|---|---|---|
-| CUDA (RTX 3060) | 170.4 | 2.84× | yes (`0x60a72320e9b551b3`) |
+| CUDA (RTX 3060) | 170.4 | 2.84× | yes (`0x6030f7fd8a445e92`) |
 | OpenMP (4 threads) | 5 473 | 91.2× | yes (`0xaac0fc87da9672b9`) |
 
-OpenMP outperforms CUDA at every current scene size: GPU per-frame overhead (kernel-launch latency plus the single `download_count` sync per frame for the candidate-pair count) dominates the modest per-frame compute at ≤ 1 k bodies. The GPU crossover is expected above ~5 000 bodies, a regime the single-GPU pipeline is not yet exercised at. (Hashes differ between backends by design — different FP unit behaviour; only same-backend, same-build run-to-run stability is a requirement.)
+The GPU now **outperforms the CPU at the stress scale** (1 025 bodies): ~233 fps CUDA vs ~205 fps OpenMP, the first scene where the GPU wins, after parallelising the narrowphase (§4.4) and the XPBD solver (§4.5.1) and removing the BVH-refit serialisation (§4.6). At small scene sizes (manipulator_pick, arm_push: ≤ 16 bodies) OpenMP still wins — GPU per-frame overhead (kernel-launch latency plus the single `download_count` sync per frame) dominates the tiny per-frame compute there. The crossover moves further in the GPU's favour as body count grows. (Hashes differ between backends by design — different FP unit behaviour; only same-backend, same-build run-to-run stability is a requirement.)
 
 ### 9.2 Test suite
 
@@ -273,10 +289,10 @@ OpenMP outperforms CUDA at every current scene size: GPU per-frame overhead (ker
 
 | Backend | Result | Wall time |
 |---|---|---|
-| CUDA (RTX 3060) | **14 / 15 pass** | 37.3 s |
-| OpenMP (4 threads) | **15 / 15 pass** | 17.8 s |
+| CUDA (RTX 3060) | **15 / 16 pass** | 37.3 s |
+| OpenMP (4 threads) | **16 / 16 pass** | 17.8 s |
 
-The single CUDA failure is `test_core_math_equiv` (host-vs-device math parity): one element of one transcendental result differs by 1 ULP on the GPU. It passes on OpenMP and does not affect physics determinism. Per-test timings (CUDA, seconds):
+The single CUDA failure is `test_core_math_equiv` (host-vs-device math parity): one element of one transcendental result differs by 1 ULP on the GPU. It passes on OpenMP and does not affect physics determinism. (`sim_determinism` now has three cases — 8 boxes, 256-box stack, 2-link arm — the 256-box case gating the colored solver + deep refit.) Per-test timings (CUDA, seconds):
 
 | Test | s | Test | s |
 |---|---|---|---|
@@ -292,9 +308,9 @@ The single CUDA failure is `test_core_math_equiv` (host-vs-device math parity): 
 
 ### 9.3 Determinism status
 
-Same-backend, run-to-run determinism holds for **OpenMP at all scene sizes** and for **CUDA on small/medium scenes** — manipulator_pick, arm_push, and both CI golden-gate scenes (§4.6). The CI determinism gate (`test_core_sim_determinism`: 8 boxes + 2-link arm) passes on both backends on every run.
+Same-backend, run-to-run determinism now holds **on both backends at all tested scene sizes** — manipulator_pick, arm_push, the three CI golden-gate scenes (§4.6), and `stress_test_blocks` (1 025 bodies). The CI determinism gate (`test_core_sim_determinism`: 8 boxes + 256-box stack + 2-link arm) passes bit-identically on both backends on every run.
 
-**`stress_test_blocks` (1 025 bodies) is currently non-deterministic on CUDA.** The final-state hash changes every run and `avg_contacts_per_frame` swings between runs (observed 1 707–3 387). The variation arises **in the broadphase** — contact counts already differ before the solver runs — consistent with the GPU atomic AABB-merge ordering issue described in §4.6: the parallel BVH refit performs a cross-thread read of child-node AABBs whose visibility the device-scope atomics do not reliably order. A shallow BVH (small scenes) rarely exposes the race; the deep tree at 1 025 bodies does. This affects **CUDA only** (the OpenMP refit is race-free here) and is **not caught by the CI gate**, whose scenes are small. Tracked as a known limitation (§13).
+**`stress_test_blocks` (1 025 bodies) is now deterministic on CUDA** (`3b31b708569886eb` across runs), closing the former large-scene non-determinism. The root cause was the parallel BVH refit's cross-thread read of child AABBs ordered only by a device-scope atomic; it is fixed by the level-synchronised refit (§4.6), where each merge round is a separate queue-ordered kernel so parents read only previously-finalised children. The new 256-box determinism case in the CI gate exercises the deep-BVH / colored-solver path that the small golden scenes did not.
 
 ---
 
@@ -340,7 +356,7 @@ All tests run headless. No display, no window, no graphics context required. Vis
 | **SoA data layout** | SIMD- and GPU-cache-friendly; coalesced memory access across work-items; prerequisite for automatic differentiation (persistent allocations, no reallocation). |
 | **XPBD solver** | GPU-natural (no global matrix); unified contact + joint constraint loop; simpler implementation than LCP for solo development. Accurate enough for manipulation. |
 | **XPBD joints (not Featherstone)** | Featherstone is O(n) for unbranched chains — a benefit only at 100+ links. 7-DOF arms don't justify the added complexity. Unified constraint loop is architecturally cleaner. |
-| **Sequential narrowphase + solver** | Determinism without sorting output of parallel passes. Straightforward correctness reasoning. GPU parallelism is expressed at the body/pair level, not the constraint level. |
+| **Parallel narrowphase + graph-colored solver** | Determinism *with* full constraint-level GPU parallelism: the narrowphase reproduces sequential contact order via key-sort + gather, and the solver uses graph coloring (fixed colour order, disjoint per-colour writes ⇒ deterministic, atomic-free) — the approach used by NVIDIA Newton/Warp and PhysX 5 TGS. Replaced the original single-work-item passes once they became the dominant GPU cost. |
 | **Determinism as a CI gate** | Physics bugs that only appear stochastically are the hardest to debug. Bit-identical determinism catches them with a 1-line test. ~10–30% perf cost accepted. |
 | **vcpkg manifest mode, baseline-pinned** | Reproducible builds without per-developer environment management. AdaptiveCpp excluded (requires system install with LLVM + GPU SDKs). |
 | **Headless-first, no rendering** | Decouples correctness from display availability. CI runs identically to local development. Visualization is a separate tool consuming trajectory dumps, never a validation step. |
@@ -354,9 +370,8 @@ All tests run headless. No display, no window, no graphics context required. Vis
 
 | Item | Description |
 |---|---|
-| **CUDA non-determinism at scale** | `stress_test_blocks` (1 025 bodies) gives a different hash each run on CUDA: the parallel BVH refit reads child AABBs ordered only by a device-scope atomic, which CUDA does not guarantee against the non-atomic AABB writes. Small scenes (and all of OpenMP) are unaffected, so the CI gate does not catch it. Fix: revert the refit to single-work-item, or add a correct cross-thread fence. See §4.6 / §9.3. |
-| Bitonic sort fast path is GPU-only | The single-kernel (work-group local-memory) bitonic sort is correct only on GPU backends; AdaptiveCpp's OpenMP backend mis-synchronises the work-group barriers, so the CPU build uses the multi-launch path. For pair counts > 1024 (scenes > ~1 000 bodies) **all** backends use multi-launch. Fix: oneDPL / CUB radix sort. |
-| GPU underperforms CPU at ≤ 1k bodies | GPU launch + per-frame sync overhead dominates at small body counts. Crossover expected above ~5 000 bodies. |
+| Bitonic sort fast path is GPU-only | The single-kernel (work-group local-memory) bitonic sort is correct only on GPU backends; AdaptiveCpp's OpenMP backend mis-synchronises the work-group barriers, so the CPU build uses the multi-launch path. For pair counts > 1024 (scenes > ~1 000 bodies) **all** backends use multi-launch. Fix: oneDPL / CUB radix sort. This is the next GPU-scaling bottleneck now that the solver is parallel. |
+| GPU underperforms CPU at small scenes | At ≤ ~16 bodies (manipulator_pick, arm_push) GPU launch + per-frame sync overhead dominates the tiny per-frame compute. The GPU now wins at the 1 025-body stress scale (~233 vs ~205 fps); the crossover moves further in the GPU's favour as body count grows. |
 | Single GPU | Multi-GPU spatial decomposition is planned (Phase 4) but not started. |
 | Windows | Deferred to v0.3+; current code is Linux-only. |
 | Differentiability | Architecture is AD-ready (persistent SoA buffers, no re-allocation, kernels structured for adjoint formulation) but not yet implemented. |

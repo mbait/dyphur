@@ -49,6 +49,7 @@ inline void qrot_to_world(const BodyView& bv, uint32_t bi,
 // Const-ref is intentional: we modify through the raw pointers, not the struct.
 inline void apply_ang_delta(const BodyView& bv, uint32_t bi,
                              float ax, float ay, float az) {
+    if (bv.inv_mass[bi] == 0.f) return;  // static/kinematic: never written
     float qw = bv.rot_w[bi], qx = bv.rot_x[bi];
     float qy = bv.rot_y[bi], qz = bv.rot_z[bi];
     bv.rot_w[bi] += 0.5f*(-ax*qx - ay*qy - az*qz);
@@ -77,6 +78,7 @@ inline void apply_pos_impulse(const BodyView& bv, uint32_t bi, float sign,
                                float rx, float ry, float rz,
                                float inv_dt) {
     float im = bv.inv_mass[bi];
+    if (im == 0.f) return;  // static/kinematic: never written
     float dx = sign * im * delta_lambda * nx;
     float dy = sign * im * delta_lambda * ny;
     float dz = sign * im * delta_lambda * nz;
@@ -187,12 +189,16 @@ inline void solve_ang_constraint(const BodyView& bv,
     float dl = -c_len / w;
     apply_ang_delta(bv, ia, -dl*ix, -dl*iy, -dl*iz);
     apply_ang_delta(bv, ib,  dl*jx,  dl*jy,  dl*jz);
-    bv.ang_x[ia] += (-dl*ix) * inv_dt;
-    bv.ang_y[ia] += (-dl*iy) * inv_dt;
-    bv.ang_z[ia] += (-dl*iz) * inv_dt;
-    bv.ang_x[ib] += (dl*jx) * inv_dt;
-    bv.ang_y[ib] += (dl*jy) * inv_dt;
-    bv.ang_z[ib] += (dl*jz) * inv_dt;
+    if (bv.inv_mass[ia] != 0.f) {
+        bv.ang_x[ia] += (-dl*ix) * inv_dt;
+        bv.ang_y[ia] += (-dl*iy) * inv_dt;
+        bv.ang_z[ia] += (-dl*iz) * inv_dt;
+    }
+    if (bv.inv_mass[ib] != 0.f) {
+        bv.ang_x[ib] += (dl*jx) * inv_dt;
+        bv.ang_y[ib] += (dl*jy) * inv_dt;
+        bv.ang_z[ib] += (dl*jz) * inv_dt;
+    }
 }
 
 // ── Full quaternion angular constraint (Fixed joint) ─────────────────────────
@@ -357,8 +363,8 @@ inline void apply_motor(const BodyView& bv, uint32_t ia, uint32_t ib,
         if (w < 1e-10f) return;
         // Both stiffness and damping generate torques integrated over h → impulse = torque * h.
         float j = (stiffness * pos_error + damping * vel_error) * h / w;
-        bv.vel_x[ia] -= wa * j * ax_w; bv.vel_y[ia] -= wa * j * ay_w; bv.vel_z[ia] -= wa * j * az_w;
-        bv.vel_x[ib] += wb * j * ax_w; bv.vel_y[ib] += wb * j * ay_w; bv.vel_z[ib] += wb * j * az_w;
+        if (bv.inv_mass[ia] != 0.f) { bv.vel_x[ia] -= wa * j * ax_w; bv.vel_y[ia] -= wa * j * ay_w; bv.vel_z[ia] -= wa * j * az_w; }
+        if (bv.inv_mass[ib] != 0.f) { bv.vel_x[ib] += wb * j * ax_w; bv.vel_y[ib] += wb * j * ay_w; bv.vel_z[ib] += wb * j * az_w; }
     } else {
         world_inv_inertia(bv, ia, ax_w, ay_w, az_w, ix_a, iy_a, iz_a);
         world_inv_inertia(bv, ib, ax_w, ay_w, az_w, ix_b, iy_b, iz_b);
@@ -367,34 +373,167 @@ inline void apply_motor(const BodyView& bv, uint32_t ia, uint32_t ib,
         float w  = wa + wb;
         if (w < 1e-10f) return;
         float j = (stiffness * pos_error + damping * vel_error) * h / w;
-        bv.ang_x[ia] -= j * ix_a; bv.ang_y[ia] -= j * iy_a; bv.ang_z[ia] -= j * iz_a;
-        bv.ang_x[ib] += j * ix_b; bv.ang_y[ib] += j * iy_b; bv.ang_z[ib] += j * iz_b;
+        if (bv.inv_mass[ia] != 0.f) { bv.ang_x[ia] -= j * ix_a; bv.ang_y[ia] -= j * iy_a; bv.ang_z[ia] -= j * iz_a; }
+        if (bv.inv_mass[ib] != 0.f) { bv.ang_x[ib] += j * ix_b; bv.ang_y[ib] += j * iy_b; bv.ang_z[ib] += j * iz_b; }
     }
 }
 
-} // anonymous namespace
+// ── One contact constraint (position + velocity + friction) ──────────────────
+// Direct body writes are guarded so static/kinematic bodies (inv_mass==0) are
+// never written — this makes them non-conflicting for graph coloring and removes
+// all parallel write hazards.
+inline void solve_contact(uint32_t c, const ContactView& cv, const BodyView& bv,
+                          float mu, float* lc, float dt) {
+    uint32_t ia = cv.body_a[c], ib = cv.body_b[c];
+    float depth = cv.depth[c];
+    if (depth <= 0.f) return;
 
-// ── XpbdSolver ───────────────────────────────────────────────────────────────
+    float remaining = depth - lc[c];
+    if (remaining <= 1e-6f) return;
 
-XpbdSolver::XpbdSolver(Stream& s, int n_iters, uint32_t max_contacts, float friction)
-    : n_iters_(n_iters), friction_(friction), lambda_c_(s, max_contacts) {}
+    float nx = cv.norm_x[c], ny = cv.norm_y[c], nz = cv.norm_z[c];
+    float px = cv.pos_x[c],  py = cv.pos_y[c],  pz = cv.pos_z[c];
 
-void XpbdSolver::solve(Stream& s, const ContactView& cv,
-                       const JointView& jv, BodyView bv, float dt) {
-    s.queue().memset(lambda_c_.data(), 0, lambda_c_.size() * sizeof(float));
+    float wa = bv.inv_mass[ia], wb = bv.inv_mass[ib];
+    float rax = px - bv.pos_x[ia], ray = py - bv.pos_y[ia], raz = pz - bv.pos_z[ia];
+    float rbx = px - bv.pos_x[ib], rby = py - bv.pos_y[ib], rbz = pz - bv.pos_z[ib];
 
-    int    ni  = n_iters_;
-    float  mu  = friction_;
-    float* lc  = lambda_c_.data();
+    float raxnx = ray*nz - raz*ny, raxny = raz*nx - rax*nz, raxnz = rax*ny - ray*nx;
+    float rbxnx = rby*nz - rbz*ny, rbxny = rbz*nx - rbx*nz, rbxnz = rbx*ny - rby*nx;
 
-    parallel_for(s, 1, [cv, jv, bv, ni, mu, lc, dt](size_t) {
-        uint32_t nc = *cv.n;
-        uint32_t nj = jv.n;
+    float iIa_x, iIa_y, iIa_z, iIb_x, iIb_y, iIb_z;
+    world_inv_inertia(bv, ia, raxnx, raxny, raxnz, iIa_x, iIa_y, iIa_z);
+    world_inv_inertia(bv, ib, rbxnx, rbxny, rbxnz, iIb_x, iIb_y, iIb_z);
 
-        // Apply PD motors once per timestep (before the GS loop).
-        // Motors modify velocities; applying them inside the GS loop creates
-        // a feedback oscillation (vel_rel changes each iteration, sign-flipping
-        // the damping term) that diverges.
+    float wa_ang = raxnx*iIa_x + raxny*iIa_y + raxnz*iIa_z;
+    float wb_ang = rbxnx*iIb_x + rbxny*iIb_y + rbxnz*iIb_z;
+    float w_total = wa + wb + wa_ang + wb_ang;
+    if (w_total < 1e-10f) return;
+
+    float dl = remaining / w_total;
+    lc[c] += remaining;
+
+    // ── Normal position correction ───────────────────────────────
+    if (wa != 0.f) { bv.pos_x[ia] += wa*dl*nx; bv.pos_y[ia] += wa*dl*ny; bv.pos_z[ia] += wa*dl*nz; }
+    if (wb != 0.f) { bv.pos_x[ib] -= wb*dl*nx; bv.pos_y[ib] -= wb*dl*ny; bv.pos_z[ib] -= wb*dl*nz; }
+    apply_ang_delta(bv, ia,  dl*iIa_x,  dl*iIa_y,  dl*iIa_z);
+    apply_ang_delta(bv, ib, -dl*iIb_x, -dl*iIb_y, -dl*iIb_z);
+
+    // ── Velocity correction ──────────────────────────────────────
+    float oax=bv.ang_x[ia], oay=bv.ang_y[ia], oaz=bv.ang_z[ia];
+    float obx=bv.ang_x[ib], oby=bv.ang_y[ib], obz=bv.ang_z[ib];
+    float vcax = bv.vel_x[ia] + oay*raz - oaz*ray;
+    float vcay = bv.vel_y[ia] + oaz*rax - oax*raz;
+    float vcaz = bv.vel_z[ia] + oax*ray - oay*rax;
+    float vcbx = bv.vel_x[ib] + oby*rbz - obz*rby;
+    float vcby = bv.vel_y[ib] + obz*rbx - obx*rbz;
+    float vcbz = bv.vel_z[ib] + obx*rby - oby*rbx;
+
+    float vrel_x = vcax - vcbx, vrel_y = vcay - vcby, vrel_z = vcaz - vcbz;
+    float vrel_n = vrel_x*nx + vrel_y*ny + vrel_z*nz;
+
+    if (vrel_n < 0.f) {
+        float j_n = -vrel_n / w_total;
+        float doa_x, doa_y, doa_z, dob_x, dob_y, dob_z;
+        world_inv_inertia(bv, ia, raxnx, raxny, raxnz, doa_x, doa_y, doa_z);
+        world_inv_inertia(bv, ib, rbxnx, rbxny, rbxnz, dob_x, dob_y, dob_z);
+        if (wa != 0.f) {
+            bv.vel_x[ia] += wa*j_n*nx; bv.vel_y[ia] += wa*j_n*ny; bv.vel_z[ia] += wa*j_n*nz;
+            bv.ang_x[ia] += j_n*doa_x; bv.ang_y[ia] += j_n*doa_y; bv.ang_z[ia] += j_n*doa_z;
+        }
+        if (wb != 0.f) {
+            bv.vel_x[ib] -= wb*j_n*nx; bv.vel_y[ib] -= wb*j_n*ny; bv.vel_z[ib] -= wb*j_n*nz;
+            bv.ang_x[ib] -= j_n*dob_x; bv.ang_y[ib] -= j_n*dob_y; bv.ang_z[ib] -= j_n*dob_z;
+        }
+    }
+
+    // ── Coulomb friction (static + dynamic) ──────────────────────
+    if (mu > 0.f) {
+        float oax2=bv.ang_x[ia], oay2=bv.ang_y[ia], oaz2=bv.ang_z[ia];
+        float obx2=bv.ang_x[ib], oby2=bv.ang_y[ib], obz2=bv.ang_z[ib];
+        float vcax2 = bv.vel_x[ia] + oay2*raz - oaz2*ray;
+        float vcay2 = bv.vel_y[ia] + oaz2*rax - oax2*raz;
+        float vcaz2 = bv.vel_z[ia] + oax2*ray - oay2*rax;
+        float vcbx2 = bv.vel_x[ib] + oby2*rbz - obz2*rby;
+        float vcby2 = bv.vel_y[ib] + obz2*rbx - obx2*rbz;
+        float vcbz2 = bv.vel_z[ib] + obx2*rby - oby2*rbx;
+        float rvx = vcax2 - vcbx2, rvy = vcay2 - vcby2, rvz = vcaz2 - vcbz2;
+        float rvn = rvx*nx + rvy*ny + rvz*nz;
+
+        float vt_x = rvx - rvn*nx;
+        float vt_y = rvy - rvn*ny;
+        float vt_z = rvz - rvn*nz;
+        float vt2  = vt_x*vt_x + vt_y*vt_y + vt_z*vt_z;
+        if (vt2 > 1e-12f) {
+            float vt_len = sycl::sqrt(vt2);
+            float tx = vt_x/vt_len, ty = vt_y/vt_len, tz = vt_z/vt_len;
+            float ratx = ray*tz - raz*ty, raty = raz*tx - rax*tz, ratz = rax*ty - ray*tx;
+            float rbtx = rby*tz - rbz*ty, rbty = rbz*tx - rbx*tz, rbtz = rbx*ty - rby*tx;
+            float fIa_x, fIa_y, fIa_z, fIb_x, fIb_y, fIb_z;
+            world_inv_inertia(bv, ia, ratx, raty, ratz, fIa_x, fIa_y, fIa_z);
+            world_inv_inertia(bv, ib, rbtx, rbty, rbtz, fIb_x, fIb_y, fIb_z);
+            float wt = wa + wb
+                     + ratx*fIa_x + raty*fIa_y + ratz*fIa_z
+                     + rbtx*fIb_x + rbty*fIb_y + rbtz*fIb_z;
+            if (wt > 1e-10f) {
+                float j_n_static = lc[c] / (dt * w_total);
+                float j_t = vt_len / wt;
+                j_t = sycl::fmin(j_t, mu * j_n_static);
+                if (wa != 0.f) {
+                    bv.vel_x[ia] -= wa*j_t*tx; bv.vel_y[ia] -= wa*j_t*ty; bv.vel_z[ia] -= wa*j_t*tz;
+                    bv.ang_x[ia] -= j_t*fIa_x; bv.ang_y[ia] -= j_t*fIa_y; bv.ang_z[ia] -= j_t*fIa_z;
+                }
+                if (wb != 0.f) {
+                    bv.vel_x[ib] += wb*j_t*tx; bv.vel_y[ib] += wb*j_t*ty; bv.vel_z[ib] += wb*j_t*tz;
+                    bv.ang_x[ib] += j_t*fIb_x; bv.ang_y[ib] += j_t*fIb_y; bv.ang_z[ib] += j_t*fIb_z;
+                }
+            }
+        }
+    }
+}
+
+// ── One joint constraint (writes only via the guarded helpers above) ──────────
+inline void solve_joint(uint32_t j, const JointView& jv, const BodyView& bv, float dt) {
+    uint32_t ia = jv.body_parent[j], ib = jv.body_child[j];
+    uint8_t  jtype = jv.type[j];
+
+    float rax, ray, raz;
+    qrot_to_world(bv, ia, jv.anchor_px[j], jv.anchor_py[j], jv.anchor_pz[j], rax, ray, raz);
+    float rbx, rby, rbz;
+    qrot_to_world(bv, ib, jv.anchor_cx[j], jv.anchor_cy[j], jv.anchor_cz[j], rbx, rby, rbz);
+
+    float alpha_pos = jv.compliance_pos[j] / (dt * dt);
+    float alpha_ang = jv.compliance_ang[j] / (dt * dt);
+    float alx = jv.axis_px[j], aly = jv.axis_py[j], alz = jv.axis_pz[j];
+    float inv_dt = 1.f / dt;
+
+    if (jtype == static_cast<uint8_t>(JointType::Prismatic)) {
+        float axw, ayw, azw;
+        qrot_to_world(bv, ia, alx, aly, alz, axw, ayw, azw);
+        solve_fixed_ang(bv, ia, ib, alpha_ang, inv_dt);
+        solve_transverse_pos(bv, ia, ib, rax, ray, raz, rbx, rby, rbz,
+                             axw, ayw, azw, alpha_pos, inv_dt);
+        apply_limit(bv, ia, ib, alx, aly, alz,
+                    jv.limit_lo[j], jv.limit_hi[j], dt, jtype, inv_dt);
+    } else {
+        solve_pos_constraint(bv, ia, ib, rax, ray, raz, rbx, rby, rbz, alpha_pos, inv_dt);
+        if (jtype == static_cast<uint8_t>(JointType::Fixed)) {
+            solve_fixed_ang(bv, ia, ib, alpha_ang, inv_dt);
+        } else if (jtype == static_cast<uint8_t>(JointType::Revolute)) {
+            solve_revolute_ang(bv, ia, ib, alx, aly, alz, alpha_ang, inv_dt);
+            apply_limit(bv, ia, ib, alx, aly, alz,
+                        jv.limit_lo[j], jv.limit_hi[j], dt, jtype, inv_dt);
+        }
+    }
+}
+
+// ── Serial single-work-item Gauss-Seidel (small scenes / overflow fallback) ───
+inline void run_serial(Stream& s, const ContactView& cv, const JointView& jv,
+                       BodyView bv, int ni, float mu, float* lc, float dt,
+                       uint32_t nc, uint32_t nj) {
+    parallel_for(s, 1, [cv, jv, bv, ni, mu, lc, dt, nc, nj](size_t) {
+        // PD motors once per timestep, before the GS loop (in-loop application
+        // oscillates the damping term and diverges).
         for (uint32_t j = 0; j < nj; ++j) {
             uint32_t ia = jv.body_parent[j], ib = jv.body_child[j];
             uint8_t  jtype = jv.type[j];
@@ -406,176 +545,131 @@ void XpbdSolver::solve(Stream& s, const ContactView& cv,
                             jv.stiffness[j], jv.damping[j], dt, jtype);
             }
         }
-
         for (int iter = 0; iter < ni; ++iter) {
-
-            // ── Contact constraints ──────────────────────────────────────────
-            for (uint32_t c = 0; c < nc; ++c) {
-                uint32_t ia = cv.body_a[c], ib = cv.body_b[c];
-                float depth = cv.depth[c];
-                if (depth <= 0.f) continue;
-
-                float remaining = depth - lc[c];
-                if (remaining <= 1e-6f) continue;
-
-                float nx = cv.norm_x[c], ny = cv.norm_y[c], nz = cv.norm_z[c];
-                float px = cv.pos_x[c],  py = cv.pos_y[c],  pz = cv.pos_z[c];
-
-                float wa = bv.inv_mass[ia], wb = bv.inv_mass[ib];
-                float rax = px - bv.pos_x[ia], ray = py - bv.pos_y[ia], raz = pz - bv.pos_z[ia];
-                float rbx = px - bv.pos_x[ib], rby = py - bv.pos_y[ib], rbz = pz - bv.pos_z[ib];
-
-                float raxnx = ray*nz - raz*ny, raxny = raz*nx - rax*nz, raxnz = rax*ny - ray*nx;
-                float rbxnx = rby*nz - rbz*ny, rbxny = rbz*nx - rbx*nz, rbxnz = rbx*ny - rby*nx;
-
-                float iIa_x, iIa_y, iIa_z, iIb_x, iIb_y, iIb_z;
-                world_inv_inertia(bv, ia, raxnx, raxny, raxnz, iIa_x, iIa_y, iIa_z);
-                world_inv_inertia(bv, ib, rbxnx, rbxny, rbxnz, iIb_x, iIb_y, iIb_z);
-
-                float wa_ang = raxnx*iIa_x + raxny*iIa_y + raxnz*iIa_z;
-                float wb_ang = rbxnx*iIb_x + rbxny*iIb_y + rbxnz*iIb_z;
-                float w_total = wa + wb + wa_ang + wb_ang;
-                if (w_total < 1e-10f) continue;
-
-                float dl = remaining / w_total;
-                lc[c] += remaining;
-
-                // ── Normal position correction ───────────────────────────────
-                bv.pos_x[ia] += wa * dl * nx; bv.pos_y[ia] += wa * dl * ny; bv.pos_z[ia] += wa * dl * nz;
-                bv.pos_x[ib] -= wb * dl * nx; bv.pos_y[ib] -= wb * dl * ny; bv.pos_z[ib] -= wb * dl * nz;
-                apply_ang_delta(bv, ia,  dl * iIa_x,  dl * iIa_y,  dl * iIa_z);
-                apply_ang_delta(bv, ib, -dl * iIb_x, -dl * iIb_y, -dl * iIb_z);
-
-                // ── Velocity correction ──────────────────────────────────────
-                float oax=bv.ang_x[ia], oay=bv.ang_y[ia], oaz=bv.ang_z[ia];
-                float obx=bv.ang_x[ib], oby=bv.ang_y[ib], obz=bv.ang_z[ib];
-                float vcax = bv.vel_x[ia] + oay*raz - oaz*ray;
-                float vcay = bv.vel_y[ia] + oaz*rax - oax*raz;
-                float vcaz = bv.vel_z[ia] + oax*ray - oay*rax;
-                float vcbx = bv.vel_x[ib] + oby*rbz - obz*rby;
-                float vcby = bv.vel_y[ib] + obz*rbx - obx*rbz;
-                float vcbz = bv.vel_z[ib] + obx*rby - oby*rbx;
-
-                float vrel_x = vcax - vcbx, vrel_y = vcay - vcby, vrel_z = vcaz - vcbz;
-                float vrel_n = vrel_x*nx + vrel_y*ny + vrel_z*nz;
-
-                // ── Normal velocity correction (restitution-free) ────────────
-                // Only removes the approaching component; resting/separating skipped.
-                if (vrel_n < 0.f) {
-                    float j_n = -vrel_n / w_total;
-                    bv.vel_x[ia] += wa*j_n*nx; bv.vel_y[ia] += wa*j_n*ny; bv.vel_z[ia] += wa*j_n*nz;
-                    bv.vel_x[ib] -= wb*j_n*nx; bv.vel_y[ib] -= wb*j_n*ny; bv.vel_z[ib] -= wb*j_n*nz;
-                    float doa_x, doa_y, doa_z, dob_x, dob_y, dob_z;
-                    world_inv_inertia(bv, ia, raxnx, raxny, raxnz, doa_x, doa_y, doa_z);
-                    world_inv_inertia(bv, ib, rbxnx, rbxny, rbxnz, dob_x, dob_y, dob_z);
-                    bv.ang_x[ia] += j_n*doa_x; bv.ang_y[ia] += j_n*doa_y; bv.ang_z[ia] += j_n*doa_z;
-                    bv.ang_x[ib] -= j_n*dob_x; bv.ang_y[ib] -= j_n*dob_y; bv.ang_z[ib] -= j_n*dob_z;
-                }
-
-                // ── Coulomb friction (static + dynamic) ──────────────────────
-                // The friction bound is the *normal force* implied by the position
-                // solve, expressed as a momentum impulse: j_n_static = λ_n/(dt·w).
-                // lc[c] is the accumulated normal penetration resolved this step
-                // (the constraint multiplier with zero compliance), so it is nonzero
-                // for any sustained contact — giving correct static friction that
-                // holds resting stacks and friction grasps.  Recompute the
-                // contact-point relative velocity after the normal correction.
-                if (mu > 0.f) {
-                    float oax2=bv.ang_x[ia], oay2=bv.ang_y[ia], oaz2=bv.ang_z[ia];
-                    float obx2=bv.ang_x[ib], oby2=bv.ang_y[ib], obz2=bv.ang_z[ib];
-                    float vcax2 = bv.vel_x[ia] + oay2*raz - oaz2*ray;
-                    float vcay2 = bv.vel_y[ia] + oaz2*rax - oax2*raz;
-                    float vcaz2 = bv.vel_z[ia] + oax2*ray - oay2*rax;
-                    float vcbx2 = bv.vel_x[ib] + oby2*rbz - obz2*rby;
-                    float vcby2 = bv.vel_y[ib] + obz2*rbx - obx2*rbz;
-                    float vcbz2 = bv.vel_z[ib] + obx2*rby - oby2*rbx;
-                    float rvx = vcax2 - vcbx2, rvy = vcay2 - vcby2, rvz = vcaz2 - vcbz2;
-                    float rvn = rvx*nx + rvy*ny + rvz*nz;
-
-                    float vt_x = rvx - rvn*nx;
-                    float vt_y = rvy - rvn*ny;
-                    float vt_z = rvz - rvn*nz;
-                    float vt2  = vt_x*vt_x + vt_y*vt_y + vt_z*vt_z;
-                    if (vt2 > 1e-12f) {
-                        float vt_len = sycl::sqrt(vt2);
-                        float tx = vt_x/vt_len, ty = vt_y/vt_len, tz = vt_z/vt_len;
-                        float ratx = ray*tz - raz*ty, raty = raz*tx - rax*tz, ratz = rax*ty - ray*tx;
-                        float rbtx = rby*tz - rbz*ty, rbty = rbz*tx - rbx*tz, rbtz = rbx*ty - rby*tx;
-                        float fIa_x, fIa_y, fIa_z, fIb_x, fIb_y, fIb_z;
-                        world_inv_inertia(bv, ia, ratx, raty, ratz, fIa_x, fIa_y, fIa_z);
-                        world_inv_inertia(bv, ib, rbtx, rbty, rbtz, fIb_x, fIb_y, fIb_z);
-                        float wt = wa + wb
-                                 + ratx*fIa_x + raty*fIa_y + ratz*fIa_z
-                                 + rbtx*fIb_x + rbty*fIb_y + rbtz*fIb_z;
-                        if (wt > 1e-10f) {
-                            // Coulomb bound from the position-solve normal impulse.
-                            float j_n_static = lc[c] / (dt * w_total);
-                            float j_t = vt_len / wt;
-                            j_t = sycl::fmin(j_t, mu * j_n_static);
-                            bv.vel_x[ia] -= wa*j_t*tx; bv.vel_y[ia] -= wa*j_t*ty; bv.vel_z[ia] -= wa*j_t*tz;
-                            bv.vel_x[ib] += wb*j_t*tx; bv.vel_y[ib] += wb*j_t*ty; bv.vel_z[ib] += wb*j_t*tz;
-                            bv.ang_x[ia] -= j_t*fIa_x; bv.ang_y[ia] -= j_t*fIa_y; bv.ang_z[ia] -= j_t*fIa_z;
-                            bv.ang_x[ib] += j_t*fIb_x; bv.ang_y[ib] += j_t*fIb_y; bv.ang_z[ib] += j_t*fIb_z;
-                        }
-                    }
-                }
-            } // end contact loop
-
-            // ── Joint constraints ────────────────────────────────────────────
-            for (uint32_t j = 0; j < nj; ++j) {
-                uint32_t ia = jv.body_parent[j], ib = jv.body_child[j];
-                uint8_t  jtype = jv.type[j];
-
-                // World-frame lever arms (anchor positions in body frame → world frame)
-                float rax, ray, raz;
-                qrot_to_world(bv, ia,
-                              jv.anchor_px[j], jv.anchor_py[j], jv.anchor_pz[j],
-                              rax, ray, raz);
-                float rbx, rby, rbz;
-                qrot_to_world(bv, ib,
-                              jv.anchor_cx[j], jv.anchor_cy[j], jv.anchor_cz[j],
-                              rbx, rby, rbz);
-
-                float alpha_pos = jv.compliance_pos[j] / (dt * dt);
-                float alpha_ang = jv.compliance_ang[j] / (dt * dt);
-                float alx = jv.axis_px[j], aly = jv.axis_py[j], alz = jv.axis_pz[j];
-                float inv_dt = 1.f / dt;
-
-                if (jtype == static_cast<uint8_t>(JointType::Prismatic)) {
-                    // Prismatic: fully constrained angular, 2-transverse positional
-                    float axw, ayw, azw;
-                    qrot_to_world(bv, ia, alx, aly, alz, axw, ayw, azw);
-                    solve_fixed_ang(bv, ia, ib, alpha_ang, inv_dt);
-                    solve_transverse_pos(bv, ia, ib, rax, ray, raz, rbx, rby, rbz,
-                                         axw, ayw, azw, alpha_pos, inv_dt);
-                    apply_limit(bv, ia, ib, alx, aly, alz,
-                                jv.limit_lo[j], jv.limit_hi[j], dt, jtype, inv_dt);
-                } else {
-                    // Ball, Fixed, Revolute: all have 3D positional constraint
-                    solve_pos_constraint(bv, ia, ib, rax, ray, raz, rbx, rby, rbz, alpha_pos, inv_dt);
-
-                    if (jtype == static_cast<uint8_t>(JointType::Fixed)) {
-                        solve_fixed_ang(bv, ia, ib, alpha_ang, inv_dt);
-                    } else if (jtype == static_cast<uint8_t>(JointType::Revolute)) {
-                        solve_revolute_ang(bv, ia, ib, alx, aly, alz, alpha_ang, inv_dt);
-                        apply_limit(bv, ia, ib, alx, aly, alz,
-                                    jv.limit_lo[j], jv.limit_hi[j], dt, jtype, inv_dt);
-                    }
-                    // Ball: no angular constraint
-                }
-            } // end joint loop
-
-            // Normalize quaternions every iteration to prevent drift-induced NaN.
+            for (uint32_t c = 0; c < nc; ++c) solve_contact(c, cv, bv, mu, lc, dt);
+            for (uint32_t j = 0; j < nj; ++j) solve_joint(j, jv, bv, dt);
             for (uint32_t i = 0; i < bv.n; ++i) {
                 float qw=bv.rot_w[i], qx=bv.rot_x[i], qy=bv.rot_y[i], qz=bv.rot_z[i];
-                float inv_len = sycl::rsqrt(qw*qw + qx*qx + qy*qy + qz*qz);
-                bv.rot_w[i] = qw*inv_len; bv.rot_x[i] = qx*inv_len;
-                bv.rot_y[i] = qy*inv_len; bv.rot_z[i] = qz*inv_len;
+                float inv_len = sycl::rsqrt(qw*qw+qx*qx+qy*qy+qz*qz);
+                bv.rot_w[i]=qw*inv_len; bv.rot_x[i]=qx*inv_len;
+                bv.rot_y[i]=qy*inv_len; bv.rot_z[i]=qz*inv_len;
             }
-
-        } // end Gauss-Seidel iterations
-
+        }
     });
 }
+
+} // anonymous namespace
+
+// ── XpbdSolver ───────────────────────────────────────────────────────────────
+
+XpbdSolver::XpbdSolver(Stream& s, int n_iters, uint32_t max_contacts, float friction)
+    : n_iters_(n_iters), friction_(friction),
+      lambda_c_(s, max_contacts), meta_(s, 2) {}
+
+void XpbdSolver::ensure_capacity(Stream& s, uint32_t n_constraints, uint32_t n_bodies) {
+    if (color_.size()     < n_constraints) color_     = Buffer<uint32_t>(s, n_constraints);
+    if (body_mask_.size() < n_bodies)      body_mask_ = Buffer<uint64_t>(s, n_bodies);
+}
+
+void XpbdSolver::solve(Stream& s, const ContactView& cv,
+                       const JointView& jv, BodyView bv, float dt) {
+    auto& q = s.queue();
+    q.memset(lambda_c_.data(), 0, lambda_c_.size() * sizeof(float));
+
+    int    ni  = n_iters_;
+    float  mu  = friction_;
+    float* lc  = lambda_c_.data();
+
+    // Contact count is device-resident; joints are host-known.
+    uint32_t nc = 0;
+    q.memcpy(&nc, cv.n, sizeof(uint32_t)).wait();
+    uint32_t nj    = jv.n;
+    uint32_t n_con = nc + nj;
+    if (n_con == 0) return;
+
+    // ── Small scenes: sequential path (unchanged results) ─────────────────────
+    if (force_serial_ || n_con <= kSerialThreshold) {
+        run_serial(s, cv, jv, bv, ni, mu, lc, dt, nc, nj);
+        return;
+    }
+
+    // ── Large scenes: graph-colored parallel path ─────────────────────────────
+    ensure_capacity(s, n_con, bv.n);
+    uint32_t* color = color_.data();
+    uint64_t* bmask = body_mask_.data();
+    uint32_t* meta  = meta_.data();
+    q.memset(bmask, 0, static_cast<size_t>(bv.n) * sizeof(uint64_t));
+    q.memset(meta,  0, 2 * sizeof(uint32_t));
+
+    // Deterministic greedy coloring: contacts [0,nc) then joints [nc,n_con).
+    // Only dynamic bodies (inv_mass>0) are conflict nodes; per-body 64-bit
+    // used-color mask; lowest free color via clz of the lowest set bit of ~used.
+    parallel_for(s, 1, [cv, jv, bv, color, bmask, meta, nc, n_con](size_t) {
+        uint32_t max_col = 0;
+        for (uint32_t k = 0; k < n_con; ++k) {
+            uint32_t a, b;
+            if (k < nc) { a = cv.body_a[k];        b = cv.body_b[k]; }
+            else        { a = jv.body_parent[k-nc]; b = jv.body_child[k-nc]; }
+            bool da = (bv.inv_mass[a] != 0.f);
+            bool db = (bv.inv_mass[b] != 0.f);
+            uint64_t used = (da ? bmask[a] : 0ull) | (db ? bmask[b] : 0ull);
+            uint64_t freebits = ~used;
+            uint32_t col;
+            if (freebits == 0ull) { col = 63u; meta[1] = 1u; }       // >64 colors: overflow
+            else {
+                uint64_t lowbit = freebits & (0ull - freebits);      // isolate lowest set bit
+                col = 63u - static_cast<uint32_t>(sycl::clz(lowbit));
+            }
+            color[k] = col;
+            uint64_t bit = (uint64_t)1 << col;
+            if (da) bmask[a] |= bit;
+            if (db) bmask[b] |= bit;
+            if (col > max_col) max_col = col;
+        }
+        meta[0] = max_col + 1;
+    });
+
+    uint32_t h_meta[2];
+    q.memcpy(h_meta, meta, 2 * sizeof(uint32_t)).wait();
+    uint32_t n_colors = h_meta[0];
+    if (h_meta[1]) {  // overflow (>64 colors on one body): safe sequential fallback
+        run_serial(s, cv, jv, bv, ni, mu, lc, dt, nc, nj);
+        return;
+    }
+
+    // PD motor pre-pass — colored (joints only), one kernel per color.
+    for (uint32_t ci = 0; ci < n_colors; ++ci) {
+        parallel_for(s, n_con, [cv, jv, bv, color, dt, nc, ci](size_t k) {
+            if (color[k] != ci || k < nc) return;
+            uint32_t j = static_cast<uint32_t>(k) - nc;
+            uint8_t jtype = jv.type[j];
+            if (jtype == static_cast<uint8_t>(JointType::Revolute) ||
+                jtype == static_cast<uint8_t>(JointType::Prismatic)) {
+                apply_motor(bv, jv.body_parent[j], jv.body_child[j],
+                            jv.axis_px[j], jv.axis_py[j], jv.axis_pz[j],
+                            jv.target_pos[j], jv.target_vel[j],
+                            jv.stiffness[j], jv.damping[j], dt, jtype);
+            }
+        });
+    }
+
+    // Gauss-Seidel across colors, parallel within a color (disjoint dynamic bodies).
+    for (int iter = 0; iter < ni; ++iter) {
+        for (uint32_t ci = 0; ci < n_colors; ++ci) {
+            parallel_for(s, n_con, [cv, jv, bv, mu, lc, dt, nc, color, ci](size_t k) {
+                if (color[k] != ci) return;
+                if (k < nc) solve_contact(static_cast<uint32_t>(k), cv, bv, mu, lc, dt);
+                else        solve_joint(static_cast<uint32_t>(k) - nc, jv, bv, dt);
+            });
+        }
+        parallel_for(s, bv.n, [bv](size_t i) {
+            float qw=bv.rot_w[i], qx=bv.rot_x[i], qy=bv.rot_y[i], qz=bv.rot_z[i];
+            float inv_len = sycl::rsqrt(qw*qw+qx*qx+qy*qy+qz*qz);
+            bv.rot_w[i]=qw*inv_len; bv.rot_x[i]=qx*inv_len;
+            bv.rot_y[i]=qy*inv_len; bv.rot_z[i]=qz*inv_len;
+        });
+    }
+}
+
 
 } // namespace dyphur

@@ -65,7 +65,7 @@ The entire compute layer is exposed through a thin C++ header API in `compute/in
 
 - `Buffer<T>` — USM (unified shared memory) device allocation with typed `upload()` / `download()` and raw `data()` pointer for kernel capture.
 - `parallel_for(Stream&, size_t n, lambda)` — submits a work-item kernel over `[0, n)`. The lambda captures `Buffer::data()` pointers (plain pointers, no smart-pointer overhead in kernels).
-- `sort_by_key(Stream&, Key*, Value*, size_t n)` — bitonic sort. For `n ≤ 1024`: single kernel launch using SYCL local memory — all `O(log² n)` bitonic passes execute on-chip without PCIe round-trips. For `n > 1024`: multi-launch fallback.
+- `sort_by_key(Stream&, Key*, Value*, size_t n)` — bitonic sort. On **GPU backends** with `n ≤ 1024`: a single kernel launch using SYCL work-group local memory — all `O(log² n)` bitonic passes execute on-chip without PCIe round-trips. Otherwise (`n > 1024`, or any CPU/OpenMP build): a multi-launch path, one global kernel per bitonic step, ordered by the in-order queue. (The local-memory fast path is gated to GPUs because AdaptiveCpp's OpenMP backend does not reliably synchronise the work-group barriers it relies on.)
 - `reduce(Stream&, T*, size_t n, T init, BinaryOp)` — parallel tree reduction.
 - `atomic_add_seq(T*, T)` — sequentially-consistent fetch-add, used for lock-free counters inside kernels (e.g., broadphase pair accumulator, Karras BVH refit flags).
 - `Stream` — owns an `sycl::queue`. In-order by default, giving automatic kernel serialisation within a frame without explicit events.
@@ -151,18 +151,21 @@ Full angular response: `I_world⁻¹ = R · I_body⁻¹ · Rᵀ`. Quaternions ar
 
 Determinism on the same hardware + build is a hard requirement, enforced by CI.
 
-Achieved by five mechanisms:
-1. **Stable Morton sort**: 64-bit key `(morton30 << 32) | body_idx` makes equal-Morton bodies sort by index → deterministic tree every run.
-2. **Single-work-item AABB refit**: avoids non-deterministic memory-order dependence of GPU atomic AABB merges. (Empirical testing showed that `memory_scope::device` acquire-release atomics are insufficient for non-atomic AABB reads/writes under CUDA's actual memory model.)
-3. **Bitonic sort of broadphase pairs** by canonical `(a, b)` key → deterministic contact traversal order.
-4. **Single-work-item narrowphase** over sorted pairs.
-5. **Single-work-item XPBD** with fixed contact traversal order.
+Achieved by:
+1. **Stable Morton sort**: 64-bit key `(morton30 << 32) | body_idx` makes equal-Morton bodies sort by index → deterministic, distinct keys for the Karras radix tree every run.
+2. **Bitonic sort of broadphase pairs** by canonical `(a, b)` key → deterministic contact traversal order regardless of the order pairs were atomically appended.
+3. **Single-work-item narrowphase** over the sorted pair list.
+4. **Single-work-item XPBD** with fixed contact traversal order.
 
-CPU and GPU hashes differ (expected: different FP unit behaviour, FTZ mode on GPU). Same-backend determinism: identical hash every run.
+The CI determinism gate (`test_core_sim_determinism`) covers two small scenes and passes bit-identically on both backends, every run.
 
-**Golden hashes** (OMP/CPU, Release, physics-level determinism tests):
-- Rigid-body scene (8 boxes + ground, 20 frames, 60 Hz): `0xcbcd209c3665c818`
-- Articulated arm (2-link revolute, 20 frames, 60 Hz): `0x44d086af21f338cf`
+> **Caveat — parallel BVH refit (Phase 5.5).** The bottom-up AABB refit was changed from a single-work-item loop to a Karras 2012 *parallel* refit (`parallel_for` over leaves with an atomic-flag rendezvous) for performance. That refit reads a node's two child AABBs after an atomic counter signals both subtrees are done, but on CUDA the device-scope atomic does not reliably order the non-atomic AABB writes/reads against it — so at large scene sizes a child AABB can be read stale, producing a different broadphase result run to run. This is benign for shallow trees (small scenes stay deterministic) but makes `stress_test_blocks` (1 025 bodies) non-deterministic on CUDA. OpenMP is unaffected. See §9.3 and §13. (A single-work-item refit, or a correctly fenced parallel refit, restores full determinism at a perf cost.)
+
+CPU and GPU hashes differ by design (different FP unit behaviour, FTZ on GPU). Same-backend, same-build determinism is the requirement.
+
+**Golden hashes** (Debug, physics-level determinism tests, current):
+- 8 boxes + ground, 20 frames — OMP `0xcbcd209c3665c818`, CUDA `0xfb43a5a0352e1fe8`
+- 2-link revolute arm, 20 frames — OMP `0x44d086af21f338cf`, CUDA `0x7c0a8166eb564f41`
 
 ---
 
@@ -234,56 +237,64 @@ Magnum was chosen over raw OpenGL (~1 200 LoC self-hosted) because its vcpkg por
 
 ---
 
-## 9. Performance Results
+## 9. Performance & Test Results
 
-All timings are wall-clock from the demo executables, Release build, single GPU or single CPU socket.
+All figures below are measured on the reference hardware: **NVIDIA GeForce RTX 3060** (sm_86) for CUDA and **Intel Xeon E5-2667 v4 @ 3.20 GHz, 4 OpenMP threads** for the CPU backend. Demos are Release (`-O3`); GPU figures are **warm-cache** — AdaptiveCpp JIT-compiles kernels on the first run, so a cold first run is ~1.5–2× slower (e.g. stress_test_blocks CUDA: ~36 fps cold → ~55 fps warm). The "det." column is run-to-run hash stability over 3 runs on that backend.
 
-### 9.1 stress_test_blocks — 1 025 rigid bodies
+### 9.1 Demo performance
 
-Scene: 1 024 dynamic boxes (0.4 m half-extent, 1 kg, stacked 8×8×16) + 1 static ground plane (20 m × 0.5 m × 20 m). Simulated 300 frames at 60 Hz (5 s). Contact count: ~2 600/frame.
+**manipulator_pick** — Franka Panda contact-friction pick-and-place (v0.2/v0.3 demo).
+16 bodies: Panda base + 7 links + hand + 2 fingers (loaded from URDF, driven kinematically), plus a ground plane, table, pickup cube, and 2-cube tower (dynamic). Full broadphase + narrowphase + XPBD, 16 substeps/frame, μ = 5 contact friction. 800 frames (13.3 s). The cube is held by **finger friction only** (no fixed joint), lifted, transported, and dropped onto the tower.
 
-| Hardware | Backend | FPS | Realtime factor | Deterministic |
+| Backend | FPS | Realtime | Grasp OK | Run-to-run det. |
 |---|---|---|---|---|
-| Intel Xeon E5-2667 v4 @ 3.20 GHz | OpenMP (CPU) | **254** | **4.24×** | yes (`7168a504ac96d97e`) |
-| NVIDIA GeForce RTX 3060 (sm_86) | CUDA / AdaptiveCpp SSCP | **83** | **1.39×** | yes (`db4db5b2b5c6a8e4`) |
+| CUDA (RTX 3060) | 128.5 | 2.14× | yes | yes (`35460c9aae037549`) |
+| OpenMP (4 threads) | 260.3 | 4.34× | yes | yes (`1f0d4116979b0ee9`) |
 
-The CPU outperforms the GPU at this body count because the GPU overhead (kernel launch latency, PCIe syncs per frame) exceeds the computation savings for 1k bodies. GPU advantage grows with scene size.
+**stress_test_blocks** — 1 025 rigid bodies (1 024 dynamic 0.4 m boxes stacked 8×8×16 + ground), ~3 400 contacts/frame, 300 frames (5 s).
 
-**GPU stage breakdown** (CUDA, 512 bodies, from `test_core_bench`):
+| Backend | FPS | Realtime | Run-to-run det. |
+|---|---|---|---|
+| CUDA (RTX 3060) | ~55 warm / ~36 cold | 0.92× | **NO** — see §9.3 |
+| OpenMP (4 threads) | 205.5 | 3.42× | yes (`6ffbaef0a15d3e13`) |
 
-| Stage | Mean latency | Share |
+**arm_push** — SDF-loaded 1-DOF arm sweeping into 2 pushable boxes (5 bodies, 1 revolute joint, full contact pipeline), 600 frames.
+
+| Backend | FPS | Realtime | Run-to-run det. |
+|---|---|---|---|
+| CUDA (RTX 3060) | 170.4 | 2.84× | yes (`0x60a72320e9b551b3`) |
+| OpenMP (4 threads) | 5 473 | 91.2× | yes (`0xaac0fc87da9672b9`) |
+
+OpenMP outperforms CUDA at every current scene size: GPU per-frame overhead (kernel-launch latency plus the single `download_count` sync per frame for the candidate-pair count) dominates the modest per-frame compute at ≤ 1 k bodies. The GPU crossover is expected above ~5 000 bodies, a regime the single-GPU pipeline is not yet exercised at. (Hashes differ between backends by design — different FP unit behaviour; only same-backend, same-build run-to-run stability is a requirement.)
+
+### 9.2 Test suite
+
+`ctest` over the `smoke` + `determinism` labels, Debug build:
+
+| Backend | Result | Wall time |
 |---|---|---|
-| Broadphase sort_pairs | 4.26 ms | 77% |
-| Broadphase build+query | 0.90 ms | 16% |
-| Integrator | 0.18 ms | 3% |
-| Narrowphase | 0.12 ms | 2% |
-| XPBD solver | 0.05 ms | 1% |
+| CUDA (RTX 3060) | **14 / 15 pass** | 37.3 s |
+| OpenMP (4 threads) | **15 / 15 pass** | 17.8 s |
 
-The sort dominates because the original multi-launch bitonic sort incurred ~77 µs per kernel launch × 45–55 launches per frame. This was the primary optimization target in Phase 5.5 performance work: a single-kernel bitonic sort (for pair counts ≤ 1024, covering practical body counts up to ~1 000) reduces the sort from O(log² n) launches to 1, expected ~40× sort speedup and ~3× overall frame time improvement for larger scenes.
+The single CUDA failure is `test_core_math_equiv` (host-vs-device math parity): one element of one transcendental result differs by 1 ULP on the GPU. It passes on OpenMP and does not affect physics determinism. Per-test timings (CUDA, seconds):
 
-**Performance improvements shipped (Phase 5.5)**:
-- **Sort**: single work-group kernel with local memory for n ≤ 1024 — O(log² n) launches → 1 launch.
-- **BVH refit**: changed from single-work-item sequential loop to Karras 2012 parallel refit (`parallel_for(n_leaves, ...)` with atomic-flag synchronisation). Expected: linear speedup in leaf count.
-- **Sync removal**: eliminated one blocking `download_count` GPU sync per frame from the stress test hot loop.
+| Test | s | Test | s |
+|---|---|---|---|
+| compute_smoke | 1.9 | core_xpbd | 2.3 |
+| compute_determinism | 0.7 | sim_determinism | 0.2 |
+| core_math_equiv | 0.96 ✗ | ray_query | 3.1 |
+| core_articulation | 1.0 | scene_smoke | 14.1 |
+| core_body | 0.1 | arm_push_smoke | 5.7 |
+| core_integrator | 0.4 | pytest_contact_sensor | 0.5 |
+| core_broadphase | 5.1 | core_narrowphase | 1.4 |
 
-### 9.2 manipulator_pick — 7-DOF arm
+`scene_smoke` dominates because it runs the V-HACD convex-decomposition pipeline end to end.
 
-Scene: static base + 7 revolute-jointed links + pre-grasped block (9 bodies, 8 joints). PD-controlled scripted pick-and-place. No broadphase/narrowphase (joint-only).
+### 9.3 Determinism status
 
-| Hardware | Backend | Frames | FPS | Realtime factor |
-|---|---|---|---|---|
-| Intel Xeon E5-2667 v4 | OpenMP (CPU) | 600 | **~4 027** | **~67×** |
+Same-backend, run-to-run determinism holds for **OpenMP at all scene sizes** and for **CUDA on small/medium scenes** — manipulator_pick, arm_push, and both CI golden-gate scenes (§4.6). The CI determinism gate (`test_core_sim_determinism`: 8 boxes + 2-link arm) passes on both backends on every run.
 
-### 9.3 arm_push — SDF-loaded arm with contacts
-
-Scene: 5 bodies (static floor + 2 pushable boxes + arm base + arm link), 1 revolute joint, loaded from `arm_room.sdf`. Full broadphase + narrowphase + XPBD per frame.
-
-| Hardware | Backend | Frames | FPS | Realtime factor |
-|---|---|---|---|---|
-| Intel Xeon E5-2667 v4 | OpenMP (CPU) | 600 | **6 579** | **109.6×** |
-| NVIDIA RTX 3060 | CUDA | 60 | 22 | 0.37× |
-
-The CUDA figure for 5 bodies is sub-realtime because GPU overhead completely dominates; this demo is intended as a functional correctness gate, not a performance target.
+**`stress_test_blocks` (1 025 bodies) is currently non-deterministic on CUDA.** The final-state hash changes every run and `avg_contacts_per_frame` swings between runs (observed 1 707–3 387). The variation arises **in the broadphase** — contact counts already differ before the solver runs — consistent with the GPU atomic AABB-merge ordering issue described in §4.6: the parallel BVH refit performs a cross-thread read of child-node AABBs whose visibility the device-scope atomics do not reliably order. A shallow BVH (small scenes) rarely exposes the race; the deep tree at 1 025 bodies does. This affects **CUDA only** (the OpenMP refit is race-free here) and is **not caught by the CI gate**, whose scenes are small. Tracked as a known limitation (§13).
 
 ---
 
@@ -306,8 +317,10 @@ The FNV-1a-64 hash (`prime = 0x00000100000001B3`, `offset = 0xcbf29ce484222325`)
 
 Tests use Catch2 v3 (includes microbenchmark support via `BENCHMARK(...)`). Two test categories are registered via CMake helpers:
 
-- `dyphur_add_smoke_test(target)` — label `smoke`. Fast correctness checks run on every build. Currently 16 tests covering compute, math, body dynamics, articulations, integrator, broadphase, narrowphase, XPBD, ray queries, determinism, scene loading, arm_push, and Python bindings.
+- `dyphur_add_smoke_test(target)` — label `smoke`. Fast correctness checks run on every build, covering compute, math, body dynamics, articulations, integrator, broadphase, narrowphase, XPBD, ray queries, scene loading, arm_push, and Python bindings.
 - `dyphur_add_determinism_test(target)` — label `determinism`. Golden-hash regression: same input → same output.
+
+The combined `smoke` + `determinism` set is **15 tests**. Measured results (pass counts, wall time, per-test timings) are in §9.2; current status is 15/15 on OpenMP and 14/15 on CUDA (the one failure is a 1-ULP host/device math-parity check, §9.2).
 
 **CI workflow presets**:
 - `ci-linux-cuda` — CUDA backend, smoke tests
@@ -341,8 +354,9 @@ All tests run headless. No display, no window, no graphics context required. Vis
 
 | Item | Description |
 |---|---|
-| Bitonic sort n > 1024 | For pair counts > 1024 (scenes with > ~1 000 bodies), the sort still uses multi-launch. Fix: oneDPL or CUB radix sort. Expected ~40× speedup on the sort step. |
-| GPU underperforms CPU at 1k bodies | GPU launch overhead dominates at small body counts. Advantage expected above ~5 000 bodies. |
+| **CUDA non-determinism at scale** | `stress_test_blocks` (1 025 bodies) gives a different hash each run on CUDA: the parallel BVH refit reads child AABBs ordered only by a device-scope atomic, which CUDA does not guarantee against the non-atomic AABB writes. Small scenes (and all of OpenMP) are unaffected, so the CI gate does not catch it. Fix: revert the refit to single-work-item, or add a correct cross-thread fence. See §4.6 / §9.3. |
+| Bitonic sort fast path is GPU-only | The single-kernel (work-group local-memory) bitonic sort is correct only on GPU backends; AdaptiveCpp's OpenMP backend mis-synchronises the work-group barriers, so the CPU build uses the multi-launch path. For pair counts > 1024 (scenes > ~1 000 bodies) **all** backends use multi-launch. Fix: oneDPL / CUB radix sort. |
+| GPU underperforms CPU at ≤ 1k bodies | GPU launch + per-frame sync overhead dominates at small body counts. Crossover expected above ~5 000 bodies. |
 | Single GPU | Multi-GPU spatial decomposition is planned (Phase 4) but not started. |
 | Windows | Deferred to v0.3+; current code is Linux-only. |
 | Differentiability | Architecture is AD-ready (persistent SoA buffers, no re-allocation, kernels structured for adjoint formulation) but not yet implemented. |
@@ -369,7 +383,8 @@ scene/include/scene/        SDF loader, scene graph, asset types
 scene/src/                  sdf_loader.cpp, mesh_bvh.cpp, convex_hull_store.cpp
 examples/common/            scene_io.hpp — .scene descriptor read/write
 examples/stress_test_blocks/ 1k-body headless demo (v0.1 exit criterion)
-examples/manipulator_pick/  7-DOF arm scripted pick-place (v0.2 exit criterion)
+examples/manipulator_pick/  Franka Panda (URDF) contact-friction pick-and-place;
+                              assets/ holds the URDF + collision STL meshes
 examples/arm_push/          SDF-loaded arm + boxes with contacts (v0.3)
 tools/viz/                  Magnum trajectory visualiser (replay + snapshot)
 bindings/python/            nanobind Python module

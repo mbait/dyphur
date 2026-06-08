@@ -1082,6 +1082,7 @@ void Narrowphase::run(Stream& s,
 {
     store_.reset(s);
     scratch_.reset(s);
+    last_count_ = 0;
     if (n_pairs == 0) return;
 
     auto& q = s.queue();
@@ -1102,6 +1103,7 @@ void Narrowphase::run(Stream& s,
     // 2. How many contacts were produced? (one sync; the broadphase already syncs
     //    once per frame, so this adds a single extra round-trip.)
     uint32_t nc = scratch_.download_count(s);
+    last_count_ = nc;                 // true count (may exceed cap_ → overflow drop)
     if (nc > cap_) nc = cap_;
     if (nc == 0) return;
 

@@ -308,9 +308,11 @@ The single CUDA failure is `test_core_math_equiv` (host-vs-device math parity): 
 
 ### 9.3 Determinism status
 
-Same-backend, run-to-run determinism now holds **on both backends at all tested scene sizes** — manipulator_pick, arm_push, the three CI golden-gate scenes (§4.6), and `stress_test_blocks` (1 025 bodies). The CI determinism gate (`test_core_sim_determinism`: 8 boxes + 256-box stack + 2-link arm) passes bit-identically on both backends on every run.
+Same-backend, run-to-run determinism holds **on both backends at all tested scene sizes** — manipulator_pick, arm_push, the three CI golden-gate scenes (§4.6), and `stress_test_blocks` at 1 024 / 4 096 / 8 192 bodies. The CI determinism gate (`test_core_sim_determinism`: 8 boxes + 256-box stack + 2-link arm) passes bit-identically on both backends on every run. (The *value* of a same-build hash is reproducible run-to-run on the same machine; across a driver/toolchain change the value may shift, which is expected — the guarantee is same hardware + same build.)
 
-**`stress_test_blocks` is now deterministic on CUDA at every scale tested** — 1 025 bodies (`3b31b708569886eb`), 4 097 bodies (`ba0aa6b74164e0ac`), and 8 193 bodies (`d31696ce471ce816`), each identical across runs — closing the former large-scene non-determinism. The root cause was the parallel BVH refit's cross-thread read of child AABBs ordered only by a device-scope atomic; it is fixed by the level-synchronised refit (§4.6), where each merge round is a separate queue-ordered kernel so parents read only previously-finalised children. The new 256-box determinism case in the CI gate exercises the deep-BVH / colored-solver path that the small golden scenes did not.
+Two distinct large-scene non-determinism bugs were found and fixed along the way, neither in the solver:
+- **Parallel BVH refit race** (resolved 2026-06-03, §4.6): the Karras refit read child AABBs ordered only by a device-scope atomic; fixed by the level-synchronised refit (each merge round a separate queue-ordered kernel, so parents read only previously-finalised children). The 256-box CI case exercises this deep-BVH path.
+- **Transient contact-buffer overflow** (Issue 6, resolved 2026-06-08): at 8 192 bodies a collapsing 32-high stack briefly produces ~67 k contacts, which overran the demo's `MAX_CONTACTS`; the narrowphase then dropped the overflow in non-deterministic atomic-append order. Fixed by sizing the contact buffer above the transient peak (`N×16`, ~2× headroom) and surfacing a host-side `Narrowphase::overflowed()` flag so the demo logs peak buffer usage and errors loudly rather than silently corrupting determinism. With no overflow the pipeline is deterministic by construction.
 
 ### 9.4 Scaling — 1k / 4k / 8k bodies
 

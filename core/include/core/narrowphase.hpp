@@ -48,6 +48,15 @@ public:
     ContactView contacts()   noexcept { return store_.view(); }
     uint32_t download_count(Stream& s) const { return store_.download_count(s); }
 
+    // True number of contacts the most recent CPU-count run() generated, BEFORE
+    // clamping to capacity. The narrowphase already syncs this count internally, so
+    // reading it is free (no extra round-trip). If it exceeds the max_contacts the
+    // narrowphase was constructed with, contacts were dropped in non-deterministic
+    // (atomic-append) order and the result is NOT reproducible — size max_contacts
+    // above this. Updated only by the CPU-pair-count run() overload.
+    uint32_t last_contact_count() const noexcept { return last_count_; }
+    bool     overflowed()         const noexcept { return last_count_ > cap_; }
+
 private:
     // Pipeline: candidate pairs are tested in parallel (one work-item per pair),
     // appending contacts to scratch_ in non-deterministic order while tagging each
@@ -58,8 +67,9 @@ private:
     ContactStore     scratch_;   // parallel-append target (unordered)
     Buffer<uint64_t> keys_;      // per-contact sort key, padded to a power of two
     Buffer<uint32_t> perm_;      // identity → permutation that sorts keys_
-    uint32_t         cap_     = 0;
-    uint32_t         pad_cap_ = 0;  // next_pow2(cap_)
+    uint32_t         cap_        = 0;
+    uint32_t         pad_cap_    = 0;  // next_pow2(cap_)
+    uint32_t         last_count_ = 0;  // true contact count of last CPU-count run()
 };
 
 } // namespace dyphur

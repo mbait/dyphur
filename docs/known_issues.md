@@ -539,31 +539,47 @@ uses the fast path; any CPU device uses the correct multi-launch path.
 
 ## Issue 6 — `stress_test_blocks` non-deterministic at very high body counts (≥ ~8k)
 
-**Status**: open (backlog). Observed 2026-06-08 on RTX 3060, Release, `cuda` preset.
-**Affected**: `--grid 16 32 16` (8 192 bodies) — 3 runs gave 3 different hashes.
-**Not affected**: 1 024 and 4 096 bodies (deterministic run-to-run); the CI gate scenes.
+**Status**: ✅ **RESOLVED** (2026-06-08). `stress_test_blocks --grid 16 32 16`
+(8 192 bodies) now returns an identical hash across runs (`0ccc75e2…` at 300 frames,
+×3). Fixed by sizing the contact buffer above the transient peak + adding loud
+overflow detection.
+**Was**: open. Observed on RTX 3060, Release, `cuda` preset; 3 runs gave 3 hashes.
+1 024 / 4 096 bodies were unaffected.
 
-### Likely cause
+### Root cause (confirmed by measurement)
 
-Tall stacks (32 boxes high) interpenetrate violently in the first frames, spiking the
-per-frame candidate-pair and contact counts far above steady state. If a transient
-spike exceeds a capacity bound (broadphase `max_pairs`, narrowphase contact store, or
-the solver's lambda buffer), the overflowing entries are dropped via `if (idx < cap)`
-guards — and *which* are dropped depends on atomic-append order, which is not
-deterministic. The pair set then differs run to run. Note the determinism is lost in
-the broadphase/narrowphase (count-dependent), not the solver.
+Tall stacks (32 boxes high) collapse in the first ~200 frames, transiently spiking the
+contact count to **67 333** at 8 192 bodies (~8.2 contacts/body) versus the settled
+~3–5. That just exceeded the demo's old `MAX_CONTACTS = N_DYN × 8 = 65 536`. The
+narrowphase appends contacts to a fixed-capacity scratch buffer with an atomic counter
+and **drops anything past the cap** (`if (idx >= capacity) return`); *which* contacts
+are dropped depends on the non-deterministic atomic-append order, so the kept set —
+and therefore the trajectory — diverged run to run. With no overflow the whole
+pipeline is deterministic by construction, so removing the overflow restored it.
+(Candidate **pairs** peaked at 159 k, below the pair cap — only contacts overflowed.)
 
-### Fix options
+### Fix
 
-1. Size capacities for the transient worst case (cheap; `stress_test_blocks` already
-   scales them with body count — raise the multipliers), or
-2. Make overflow deterministic (e.g. reserve slots by a stable key rather than a race),
-   or detect overflow and grow + re-run the frame.
+1. **Size for the transient peak** (`examples/stress_test_blocks/main.cpp`):
+   `MAX_CONTACTS = N_DYN × 16` (≈2× the measured peak) and `MAX_PAIRS = N_DYN × 48`.
+2. **Make overflow loud** so it can never silently break determinism again. The
+   narrowphase already syncs the true contact count internally, so it now caches it:
+   `Narrowphase::last_contact_count()` / `overflowed()` (`> max_contacts`) are free to
+   read (no extra round-trip). The demo tracks the per-frame peak of this and of the
+   broadphase pair count (also the true count) and logs `Peak usage: … (headroom OK)`
+   or an `error` if either reached capacity.
 
-### Verification
+Deterministic top-k under parallel append was considered and rejected: keeping a
+deterministic subset requires seeing all candidates, i.e. an intermediate buffer sized
+for the peak anyway — so sizing the buffer is the right fix, and silent dropping is
+guarded instead.
 
-Extend the determinism gate with an 8k+ stacked case once a fix lands; confirm
-`stress_test_blocks --grid 16 32 16` returns an identical hash across 3 runs.
+### Follow-up (not done)
+
+The library still drops silently inside the kernels; only the narrowphase exposes a
+host-side overflow flag (CPU-count `run()` only). The broadphase and the async
+narrowphase overload don't yet. A general solution (grow-and-retry, or an asserted
+hard cap) is left for when a non-demo caller needs it.
 
 ---
 
@@ -579,9 +595,8 @@ Extend the determinism gate with an 8k+ stacked case once a fix lands; confirm
 | 3   | ~~`test_core_articulation` SIGSEGV (Fixed/Revolute)~~  | resolved in Phase 5                          | —      | ✅ resolved  |
 | 4   | ~~CUDA non-determinism at scale (parallel BVH refit AABB race)~~ | resolved 2026-06-03 (level-sync refit) | —      | ✅ resolved |
 | 5   | ~~Morton-sort fast path gated by compile-time macro (broke CPU determinism path)~~ | resolved 2026-06-08 (runtime device gate) | — | ✅ resolved |
-| 6   | `stress_test_blocks` non-deterministic at ≥ ~8k bodies (transient capacity overflow) | `examples/stress_test_blocks/main.cpp`, broadphase/narrowphase caps | M | correctness (extreme scenes only) |
+| 6   | ~~`stress_test_blocks` non-deterministic at ≥ ~8k bodies (transient capacity overflow)~~ | resolved 2026-06-08 (size contact buffer + loud overflow detection) | — | ✅ resolved |
 
 Remaining open:
 - **Issue 2a** — n > 1024 pair sort still multi-launch (oneDPL/CUB or radix sort);
   minor now (the colored solver, not the sort, is the scaling story).
-- **Issue 6** — transient capacity overflow makes ≥ ~8k-body stacks non-deterministic.

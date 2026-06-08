@@ -74,8 +74,12 @@ int main(int argc, char** argv) {
     const int N_BODIES = N_DYN + 1;                  // +1 static ground
 
     // Capacities scale with body count (the grid can now be 4k/8k+ via --grid).
-    const uint32_t MAX_PAIRS    = std::max<uint32_t>(65536u, static_cast<uint32_t>(N_DYN) * 32u);
-    const uint32_t MAX_CONTACTS = std::max<uint32_t>(16384u, static_cast<uint32_t>(N_DYN) * 8u);
+    // Sized for the transient peak during settling, not steady state: a collapsing
+    // 32-high stack briefly hits ~8 contacts/body and ~20 candidate pairs/body, well
+    // above the settled ~3–5. Under-sizing silently drops pairs/contacts in atomic
+    // order → non-deterministic results (was Issue 6); overflow is detected below.
+    const uint32_t MAX_PAIRS    = std::max<uint32_t>(65536u, static_cast<uint32_t>(N_DYN) * 48u);
+    const uint32_t MAX_CONTACTS = std::max<uint32_t>(16384u, static_cast<uint32_t>(N_DYN) * 16u);
 
     constexpr float BOX_H  = 0.4f;   // half-extent of dynamic boxes
     constexpr float GND_HY = 0.5f;   // ground half-height
@@ -252,12 +256,19 @@ int main(int argc, char** argv) {
     // ── Main simulation loop ──────────────────────────────────────────────────
     auto wall_start = Clock::now();
 
+    // Track buffer-capacity peaks. Both counters hold the *true* count (atomics keep
+    // counting past the cap), so a peak ≥ capacity means entries were dropped in
+    // non-deterministic order — fatal to reproducibility. n_pairs is free (already
+    // downloaded); np.last_contact_count() is a cached host value (no extra sync).
+    uint32_t peak_pairs = 0, peak_contacts = 0;
     for (int frame = 0; frame < n_frames; ++frame) {
         integrate(s, bv, ip);
         bp.build_and_query(s, bv, sv, scene_bounds);
         uint32_t n_pairs = bp.download_count(s);  // one sync per frame
         bp.sort_pairs(s, n_pairs);                 // no-op when n_pairs <= 1
         np.run(s, bp.pairs_ptr(), n_pairs, bv, sv);  // always resets contact store
+        peak_pairs    = std::max(peak_pairs, n_pairs);
+        peak_contacts = std::max(peak_contacts, np.last_contact_count());
         solver.solve(s, np.contacts(), JointView{}, bv, DT);
 
         // Trajectory snapshot every other frame (download_state provides GPU sync).
@@ -270,6 +281,17 @@ int main(int argc, char** argv) {
     // blocking sync inside the hot loop.
     s.wait();
     double avg_cnt = static_cast<double>(np.download_count(s));
+
+    // Determinism guard: a peak at/above capacity means entries were dropped in
+    // atomic-append order, which makes the run non-reproducible (Issue 6).
+    if (peak_pairs >= MAX_PAIRS || peak_contacts >= MAX_CONTACTS) {
+        spdlog::error("CAPACITY OVERFLOW — results are NON-deterministic. "
+                      "peak pairs {}/{}, peak contacts {}/{}. Increase MAX_PAIRS/MAX_CONTACTS.",
+                      peak_pairs, MAX_PAIRS, peak_contacts, MAX_CONTACTS);
+    } else {
+        spdlog::info("Peak usage: pairs {}/{}, contacts {}/{} (headroom OK)",
+                     peak_pairs, MAX_PAIRS, peak_contacts, MAX_CONTACTS);
+    }
 
     traj.close();
 

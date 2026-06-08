@@ -88,12 +88,7 @@ Broadphase::Broadphase(Stream& s, uint32_t max_bodies, uint32_t max_pairs)
     , d_left_(s, max_bodies > 1 ? max_bodies - 1 : 1)
     , d_right_(s, max_bodies > 1 ? max_bodies - 1 : 1)
     , d_parent_(s, max_bodies > 1 ? 2 * max_bodies - 1 : 1)
-    , d_aabb_min_x_(s, max_bodies > 1 ? 2 * max_bodies - 1 : 1)
-    , d_aabb_min_y_(s, max_bodies > 1 ? 2 * max_bodies - 1 : 1)
-    , d_aabb_min_z_(s, max_bodies > 1 ? 2 * max_bodies - 1 : 1)
-    , d_aabb_max_x_(s, max_bodies > 1 ? 2 * max_bodies - 1 : 1)
-    , d_aabb_max_y_(s, max_bodies > 1 ? 2 * max_bodies - 1 : 1)
-    , d_aabb_max_z_(s, max_bodies > 1 ? 2 * max_bodies - 1 : 1)
+    , d_aabb_(s, max_bodies > 1 ? 2 * max_bodies - 1 : 1)
     , d_flags_(s, max_bodies > 1 ? max_bodies - 1 : 1)
     , d_root_(s, 1)
     , d_pairs_(s, max_pairs)
@@ -211,12 +206,7 @@ void Broadphase::build_and_query(Stream&         s,
         const uint32_t* d_si   = d_sorted_idx_.data();
         const int32_t*  d_lft  = d_left_.data();
         const int32_t*  d_rgt  = d_right_.data();
-        sycl::half* d_mn_x = d_aabb_min_x_.data();
-        sycl::half* d_mn_y = d_aabb_min_y_.data();
-        sycl::half* d_mn_z = d_aabb_min_z_.data();
-        sycl::half* d_mx_x = d_aabb_max_x_.data();
-        sycl::half* d_mx_y = d_aabb_max_y_.data();
-        sycl::half* d_mx_z = d_aabb_max_z_.data();
+        NodeBox*  d_aabb  = d_aabb_.data();
         uint32_t* d_flags = d_flags_.data();
         const BodyView  bv = bodies;
         const ShapeView sv = shapes;
@@ -253,9 +243,11 @@ void Broadphase::build_and_query(Stream&         s,
                 mn_z = pz - ez; mx_z = pz + ez;
             }
             int nidx = ni - 1 + static_cast<int>(leaf_k);
-            d_mn_x[nidx] = sycl::half(mn_x);  d_mx_x[nidx] = sycl::half(mx_x);
-            d_mn_y[nidx] = sycl::half(mn_y);  d_mx_y[nidx] = sycl::half(mx_y);
-            d_mn_z[nidx] = sycl::half(mn_z);  d_mx_z[nidx] = sycl::half(mx_z);
+            NodeBox b;
+            b.mn_x = sycl::half(mn_x); b.mn_y = sycl::half(mn_y); b.mn_z = sycl::half(mn_z);
+            b.mx_x = sycl::half(mx_x); b.mx_y = sycl::half(mx_y); b.mx_z = sycl::half(mx_z);
+            b.pad0 = sycl::half(0.f); b.pad1 = sycl::half(0.f);
+            d_aabb[nidx] = b;
         });
 
         // (b) Level-synchronised merge rounds. One kernel per round; a node merges
@@ -276,15 +268,15 @@ void Broadphase::build_and_query(Stream&         s,
                         bool lready = (lc >= ni - 1) || d_flags[lc];
                         bool rready = (rc >= ni - 1) || d_flags[rc];
                         if (!lready || !rready) return;
-                        float pmnx = sycl::fmin(float(d_mn_x[lc]), float(d_mn_x[rc]));
-                        float pmny = sycl::fmin(float(d_mn_y[lc]), float(d_mn_y[rc]));
-                        float pmnz = sycl::fmin(float(d_mn_z[lc]), float(d_mn_z[rc]));
-                        float pmxx = sycl::fmax(float(d_mx_x[lc]), float(d_mx_x[rc]));
-                        float pmxy = sycl::fmax(float(d_mx_y[lc]), float(d_mx_y[rc]));
-                        float pmxz = sycl::fmax(float(d_mx_z[lc]), float(d_mx_z[rc]));
-                        d_mn_x[p] = sycl::half(pmnx);  d_mx_x[p] = sycl::half(pmxx);
-                        d_mn_y[p] = sycl::half(pmny);  d_mx_y[p] = sycl::half(pmxy);
-                        d_mn_z[p] = sycl::half(pmnz);  d_mx_z[p] = sycl::half(pmxz);
+                        NodeBox bl = d_aabb[lc], br = d_aabb[rc], b;
+                        b.mn_x = sycl::half(sycl::fmin(float(bl.mn_x), float(br.mn_x)));
+                        b.mn_y = sycl::half(sycl::fmin(float(bl.mn_y), float(br.mn_y)));
+                        b.mn_z = sycl::half(sycl::fmin(float(bl.mn_z), float(br.mn_z)));
+                        b.mx_x = sycl::half(sycl::fmax(float(bl.mx_x), float(br.mx_x)));
+                        b.mx_y = sycl::half(sycl::fmax(float(bl.mx_y), float(br.mx_y)));
+                        b.mx_z = sycl::half(sycl::fmax(float(bl.mx_z), float(br.mx_z)));
+                        b.pad0 = sycl::half(0.f); b.pad1 = sycl::half(0.f);
+                        d_aabb[p] = b;
                         d_flags[p] = 1u;
                     });
                 }
@@ -300,26 +292,22 @@ void Broadphase::build_and_query(Stream&         s,
     // leaf_i < j and their AABBs overlap. Canonical body ordering (a < b) is
     // enforced inside the pair before writing.
     {
-        const int32_t*    d_root  = d_root_.data();
-        const int32_t*    d_lft   = d_left_.data();
-        const int32_t*    d_rgt   = d_right_.data();
-        const sycl::half* d_mn_x  = d_aabb_min_x_.data();
-        const sycl::half* d_mn_y  = d_aabb_min_y_.data();
-        const sycl::half* d_mn_z  = d_aabb_min_z_.data();
-        const sycl::half* d_mx_x  = d_aabb_max_x_.data();
-        const sycl::half* d_mx_y  = d_aabb_max_y_.data();
-        const sycl::half* d_mx_z  = d_aabb_max_z_.data();
-        const uint32_t*   d_si    = d_sorted_idx_.data();
-        ContactPair*      d_pairs = d_pairs_.data();
-        uint32_t*         d_cnt   = d_count_.data();
-        const uint32_t    cap     = max_pairs_;
+        const int32_t*   d_root  = d_root_.data();
+        const int32_t*   d_lft   = d_left_.data();
+        const int32_t*   d_rgt   = d_right_.data();
+        const NodeBox*   d_aabb  = d_aabb_.data();
+        const uint32_t*  d_si    = d_sorted_idx_.data();
+        ContactPair*     d_pairs = d_pairs_.data();
+        uint32_t*        d_cnt   = d_count_.data();
+        const uint32_t   cap     = max_pairs_;
 
         parallel_for(s, static_cast<size_t>(n), [=](size_t leaf_j) {
             int jnode = n_int - 1 + static_cast<int>(leaf_j);
             // Load leaf AABB once as fp32 for repeated comparisons.
-            float jmnx = float(d_mn_x[jnode]), jmxx = float(d_mx_x[jnode]);
-            float jmny = float(d_mn_y[jnode]), jmxy = float(d_mx_y[jnode]);
-            float jmnz = float(d_mn_z[jnode]), jmxz = float(d_mx_z[jnode]);
+            NodeBox jb = d_aabb[jnode];
+            float jmnx = float(jb.mn_x), jmxx = float(jb.mx_x);
+            float jmny = float(jb.mn_y), jmxy = float(jb.mx_y);
+            float jmnz = float(jb.mn_z), jmxz = float(jb.mx_z);
 
             int  root = d_root[0];
             int  stack[64];
@@ -329,10 +317,11 @@ void Broadphase::build_and_query(Stream&         s,
             while (top > 0) {
                 int node = stack[--top];
 
-                // AABB overlap test: promote fp16 node bounds to fp32.
-                if (float(d_mn_x[node]) > jmxx || float(d_mx_x[node]) < jmnx ||
-                    float(d_mn_y[node]) > jmxy || float(d_mx_y[node]) < jmny ||
-                    float(d_mn_z[node]) > jmxz || float(d_mx_z[node]) < jmnz)
+                // AABB overlap test: one packed load, promote fp16 bounds to fp32.
+                NodeBox nb = d_aabb[node];
+                if (float(nb.mn_x) > jmxx || float(nb.mx_x) < jmnx ||
+                    float(nb.mn_y) > jmxy || float(nb.mx_y) < jmny ||
+                    float(nb.mn_z) > jmxz || float(nb.mx_z) < jmnz)
                     continue;
 
                 bool is_leaf = (node >= n_int - 1);
@@ -382,12 +371,7 @@ BvhView Broadphase::bvh_view(uint32_t n_active) const noexcept {
         d_parent_.data(),
         d_root_.data(),
         d_sorted_idx_.data(),
-        d_aabb_min_x_.data(),
-        d_aabb_min_y_.data(),
-        d_aabb_min_z_.data(),
-        d_aabb_max_x_.data(),
-        d_aabb_max_y_.data(),
-        d_aabb_max_z_.data(),
+        d_aabb_.data(),
         n_active,
     };
 }

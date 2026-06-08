@@ -13,21 +13,27 @@ struct ContactPair {
     uint32_t a, b;  // body indices, a < b always
 };
 
+// Per-node AABB packed into a single 16-byte record (6 fp16 bounds + 2 pad).
+// Traversal visits nodes in tree order — i.e. effectively random memory order —
+// so co-locating a node's 6 bounds in one aligned cache line turns the per-node
+// AABB fetch from 6 scattered fp16 loads into a single 128-bit load. This is the
+// dominant cost in both the broadphase pair query and ray-query traversal.
+struct alignas(16) NodeBox {
+    sycl::half mn_x, mn_y, mn_z;
+    sycl::half mx_x, mx_y, mx_z;
+    sycl::half pad0, pad1;
+};
+
 // Read-only view of BVH internals exposed for ray-query traversal.
 // Pointers are valid until the next build_and_query() call.
 // n: number of active leaves (== body count passed to build_and_query).
 struct BvhView {
-    const int32_t*    left;        // internal nodes [0, n-2]
-    const int32_t*    right;       // internal nodes [0, n-2]
-    const int32_t*    parent;      // all nodes [0, 2n-2]
-    const int32_t*    root;        // 1 element: root internal node index
-    const uint32_t*   sorted_idx;  // leaf k → original body index
-    const sycl::half* aabb_min_x;
-    const sycl::half* aabb_min_y;
-    const sycl::half* aabb_min_z;
-    const sycl::half* aabb_max_x;
-    const sycl::half* aabb_max_y;
-    const sycl::half* aabb_max_z;
+    const int32_t*  left;        // internal nodes [0, n-2]
+    const int32_t*  right;       // internal nodes [0, n-2]
+    const int32_t*  parent;      // all nodes [0, 2n-2]
+    const int32_t*  root;        // 1 element: root internal node index
+    const uint32_t* sorted_idx;  // leaf k → original body index
+    const NodeBox*  aabb;        // all nodes [0, 2n-2]: packed fp16 bounds
     uint32_t n;
 };
 
@@ -92,10 +98,10 @@ private:
     Buffer<int32_t>  d_left_;      // size max_bodies-1: left child index of internal node i
     Buffer<int32_t>  d_right_;     // size max_bodies-1: right child index
     Buffer<int32_t>  d_parent_;    // size 2*max_bodies-1: parent index (-1 for root)
-    // BVH node AABBs stored as fp16 to halve traversal bandwidth.
+    // BVH node AABBs: fp16 bounds packed one cache line per node (size 2n-1).
+    // fp16 halves bandwidth; the packing makes each node's bounds a single load.
     // The broadphase is a coarse filter; false positives are OK.
-    Buffer<sycl::half> d_aabb_min_x_, d_aabb_min_y_, d_aabb_min_z_;
-    Buffer<sycl::half> d_aabb_max_x_, d_aabb_max_y_, d_aabb_max_z_;
+    Buffer<NodeBox>  d_aabb_;
     Buffer<uint32_t> d_flags_;     // size max_bodies-1: atomic refit counters
     Buffer<int32_t>  d_root_;      // 1 element: index of the root internal node
 

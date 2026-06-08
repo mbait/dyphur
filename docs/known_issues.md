@@ -514,18 +514,74 @@ Add a large-scene case to `test_core_sim_determinism` (e.g. 256+ bodies, run twi
 
 ---
 
+## Issue 5 — Morton-sort GPU fast path selected by compile-time macro, not device
+
+**Status**: ✅ **RESOLVED** (2026-06-08). `compute/include/compute/sort.hpp` now gates
+the single-work-group local-memory bitonic fast path on `q.get_device().is_gpu()`
+at **runtime** instead of the compile-time `DYPHUR_BACKEND_IS_CUDA` macro.
+
+### Symptom / root cause
+
+The fast path keeps all bitonic passes on-chip with work-group barriers — correct on
+GPUs, but AdaptiveCpp's OpenMP backend mis-synchronises those barriers and silently
+returns an unsorted result. It was gated by a *compile-time* backend macro, so a
+**CUDA build still selected the fast path when running on `Device::default_cpu()`** —
+which is exactly what `test_core_sim_determinism` does. The CPU determinism gate was
+therefore running a broken sort, producing an out-of-order Morton array and a
+**malformed Karras tree** (observed: a 2-cycle in parent pointers, a node with
+`left == right`). The old top-down stack traversal happened to tolerate it (the
+detached cycle is unreachable from the root) and produced a deterministic-but-wrong
+result, so the bug stayed hidden until a stackless rope traversal (which walks parent
+pointers) hung on the cycle. Fix: choose the path by actual device type. The GPU still
+uses the fast path; any CPU device uses the correct multi-launch path.
+
+---
+
+## Issue 6 — `stress_test_blocks` non-deterministic at very high body counts (≥ ~8k)
+
+**Status**: open (backlog). Observed 2026-06-08 on RTX 3060, Release, `cuda` preset.
+**Affected**: `--grid 16 32 16` (8 192 bodies) — 3 runs gave 3 different hashes.
+**Not affected**: 1 024 and 4 096 bodies (deterministic run-to-run); the CI gate scenes.
+
+### Likely cause
+
+Tall stacks (32 boxes high) interpenetrate violently in the first frames, spiking the
+per-frame candidate-pair and contact counts far above steady state. If a transient
+spike exceeds a capacity bound (broadphase `max_pairs`, narrowphase contact store, or
+the solver's lambda buffer), the overflowing entries are dropped via `if (idx < cap)`
+guards — and *which* are dropped depends on atomic-append order, which is not
+deterministic. The pair set then differs run to run. Note the determinism is lost in
+the broadphase/narrowphase (count-dependent), not the solver.
+
+### Fix options
+
+1. Size capacities for the transient worst case (cheap; `stress_test_blocks` already
+   scales them with body count — raise the multipliers), or
+2. Make overflow deterministic (e.g. reserve slots by a stable key rather than a race),
+   or detect overflow and grow + re-run the frame.
+
+### Verification
+
+Extend the determinism gate with an 8k+ stacked case once a fix lands; confirm
+`stress_test_blocks --grid 16 32 16` returns an identical hash across 3 runs.
+
+---
+
 ## Summary table
 
 | ID  | Issue                                              | File(s)                                          | Effort | Impact      |
 |-----|----------------------------------------------------|--------------------------------------------------|--------|-------------|
 | 1   | ~~`test_core_math_equiv` 1-ULP CUDA failure (FMA)~~    | resolved 2026-05-28                          | —      | ✅ resolved |
 | 2   | ~~CUDA stress sub-realtime~~ — narrowphase **and** XPBD solver now parallel (~55→~101→~237 fps; GPU beats CPU) | ~~`narrowphase.cpp`~~, ~~`xpbd_solver.cpp`~~ done | —      | ✅ resolved |
-| 2a  | Bitonic sort: O(log²n) kernel launches (n > 1024)  | `compute/include/compute/sort.hpp`               | M      | now ~3% of frame (was 77%) |
+| 2a  | Bitonic sort: O(log²n) kernel launches (n > 1024)  | `compute/include/compute/sort.hpp`               | M      | now ~6–8% of frame at 8k |
 | 2b  | ~~Sequential BVH refit~~                           | resolved 2026-05-28 (caused Issue 4)             | —      | ✅ resolved |
 | 2c  | ~~Extra `np.download_count` sync per frame~~        | resolved 2026-05-28                              | —      | ✅ resolved |
 | 3   | ~~`test_core_articulation` SIGSEGV (Fixed/Revolute)~~  | resolved in Phase 5                          | —      | ✅ resolved  |
 | 4   | ~~CUDA non-determinism at scale (parallel BVH refit AABB race)~~ | resolved 2026-06-03 (level-sync refit) | —      | ✅ resolved |
+| 5   | ~~Morton-sort fast path gated by compile-time macro (broke CPU determinism path)~~ | resolved 2026-06-08 (runtime device gate) | — | ✅ resolved |
+| 6   | `stress_test_blocks` non-deterministic at ≥ ~8k bodies (transient capacity overflow) | `examples/stress_test_blocks/main.cpp`, broadphase/narrowphase caps | M | correctness (extreme scenes only) |
 
 Remaining open:
 - **Issue 2a** — n > 1024 pair sort still multi-launch (oneDPL/CUB or radix sort);
   minor now (the colored solver, not the sort, is the scaling story).
+- **Issue 6** — transient capacity overflow makes ≥ ~8k-body stacks non-deterministic.

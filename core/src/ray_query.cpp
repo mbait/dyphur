@@ -161,13 +161,14 @@ void ray_query(Stream& s,
             while (top > 0) {
                 int32_t node = stack[--top];
 
-                // Node AABB test (fp16 → fp32).
-                float mnx = float(bvh.aabb_min_x[node]);
-                float mny = float(bvh.aabb_min_y[node]);
-                float mnz = float(bvh.aabb_min_z[node]);
-                float mxx = float(bvh.aabb_max_x[node]);
-                float mxy = float(bvh.aabb_max_y[node]);
-                float mxz = float(bvh.aabb_max_z[node]);
+                // Node AABB test (one packed load, fp16 → fp32).
+                NodeBox nb = bvh.aabb[node];
+                float mnx = float(nb.mn_x);
+                float mny = float(nb.mn_y);
+                float mnz = float(nb.mn_z);
+                float mxx = float(nb.mx_x);
+                float mxy = float(nb.mx_y);
+                float mxz = float(nb.mx_z);
 
                 if (!aabb_hit(ray.ox, ray.oy, ray.oz,
                               inv_dx, inv_dy, inv_dz,

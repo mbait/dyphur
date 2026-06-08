@@ -9,14 +9,13 @@ namespace dyphur {
 // local memory, synchronised by work-group barriers.  That is correct and fast
 // on real GPUs, but AdaptiveCpp's OpenMP (CPU) backend does not reliably
 // synchronise a single work-group's local barriers for this access pattern, so
-// the sort silently produces an unsorted result there.  Restrict the fast path
-// to GPU backends; the CPU/OMP build uses the multi-launch path, whose steps are
-// separate global kernels ordered by the in-order queue (no work-group barriers).
-#if defined(DYPHUR_BACKEND_IS_CUDA) || defined(DYPHUR_BACKEND_IS_HIP) || defined(DYPHUR_BACKEND_IS_L0)
-#define DYPHUR_SORT_LOCAL_FASTPATH 1
-#else
-#define DYPHUR_SORT_LOCAL_FASTPATH 0
-#endif
+// the sort silently produces an unsorted result there.  The choice must be made
+// at RUNTIME by device type, not at compile time by backend macro: a GPU-enabled
+// build (e.g. the CUDA preset) still runs on Device::default_cpu() for the
+// determinism gate, and there the fast path would mis-synchronise and emit an
+// unsorted result (which silently corrupts the LBVH). Gate on the actual device:
+// GPU → on-chip fast path; CPU → multi-launch path (separate global kernels
+// ordered by the in-order queue, no work-group barriers).
 
 // Parallel bitonic sort of (keys, values) by ascending key.
 //
@@ -32,7 +31,7 @@ void sort_by_key(Stream& s, Key* keys, Value* values, size_t n) {
 
     auto& q = s.queue();
 
-    if (DYPHUR_SORT_LOCAL_FASTPATH && n <= 1024) {
+    if (q.get_device().is_gpu() && n <= 1024) {
         // Single kernel: load into local memory, run all passes with barriers,
         // write back. Reduces GPU kernel launches from O(log²n) to 1.
         q.submit([&](sycl::handler& h) {
@@ -92,7 +91,7 @@ void sort(Stream& s, Key* keys, size_t n) {
 
     auto& q = s.queue();
 
-    if (DYPHUR_SORT_LOCAL_FASTPATH && n <= 1024) {
+    if (q.get_device().is_gpu() && n <= 1024) {
         q.submit([&](sycl::handler& h) {
             sycl::local_accessor<Key, 1> lk(sycl::range<1>(n), h);
             h.parallel_for(

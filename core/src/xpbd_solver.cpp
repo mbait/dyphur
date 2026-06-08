@@ -5,6 +5,34 @@
 namespace dyphur {
 namespace {
 
+// Device atomics used by the parallel graph-colouring (relaxed: only the final
+// max/or/count matters, not ordering).
+inline void atomic_max_u64(uint64_t* p, uint64_t v) {
+    sycl::atomic_ref<uint64_t, sycl::memory_order::relaxed,
+        sycl::memory_scope::device, sycl::access::address_space::global_space> r(*p);
+    r.fetch_max(v);
+}
+inline void atomic_or_u64(uint64_t* p, uint64_t v) {
+    sycl::atomic_ref<uint64_t, sycl::memory_order::relaxed,
+        sycl::memory_scope::device, sycl::access::address_space::global_space> r(*p);
+    r.fetch_or(v);
+}
+inline void atomic_max_u32(uint32_t* p, uint32_t v) {
+    sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
+        sycl::memory_scope::device, sycl::access::address_space::global_space> r(*p);
+    r.fetch_max(v);
+}
+inline void atomic_dec_u32(uint32_t* p) {
+    sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
+        sycl::memory_scope::device, sycl::access::address_space::global_space> r(*p);
+    r.fetch_sub(1u);
+}
+// Deterministic integer hash (Murmur3 finalizer) → pseudo-random priority.
+inline uint32_t hash_u32(uint32_t x) {
+    x ^= x >> 16; x *= 0x85ebca6bu; x ^= x >> 13; x *= 0xc2b2ae35u; x ^= x >> 16;
+    return x;
+}
+
 // ── Math helpers (device-safe, no Eigen) ─────────────────────────────────────
 
 // World-space inverse inertia applied to v: I_world_inv * v.
@@ -564,10 +592,11 @@ inline void run_serial(Stream& s, const ContactView& cv, const JointView& jv,
 
 XpbdSolver::XpbdSolver(Stream& s, int n_iters, uint32_t max_contacts, float friction)
     : n_iters_(n_iters), friction_(friction),
-      lambda_c_(s, max_contacts), meta_(s, 2) {}
+      lambda_c_(s, max_contacts), meta_(s, 3) {}
 
 void XpbdSolver::ensure_capacity(Stream& s, uint32_t n_constraints, uint32_t n_bodies) {
     if (color_.size()     < n_constraints) color_     = Buffer<uint32_t>(s, n_constraints);
+    if (body_pri_.size()  < n_bodies)      body_pri_  = Buffer<uint64_t>(s, n_bodies);
     if (body_mask_.size() < n_bodies)      body_mask_ = Buffer<uint64_t>(s, n_bodies);
 }
 
@@ -593,64 +622,96 @@ void XpbdSolver::solve(Stream& s, const ContactView& cv,
         return;
     }
 
-    // ── Large scenes: graph-colored parallel path ─────────────────────────────
+    // ── Large scenes: deterministic parallel graph coloring (Jones–Plassmann) ──
+    // Each round, a constraint joins the independent set iff it holds the highest
+    // priority among the still-uncoloured constraints at both its dynamic bodies;
+    // it then takes the lowest colour not used by its already-coloured neighbours.
+    // Priority = (hash(index) << 32 | index): pseudo-random to break index chains
+    // (so ~O(log n) rounds, not O(chain length)), with the index in the low bits to
+    // guarantee a unique maximum ⇒ the set is independent and the result is
+    // deterministic. Replaces the old single-work-item greedy pass, which serially
+    // scanned all constraints on one GPU thread and was the solver's #1 cost.
+    constexpr uint32_t UNCOLORED = 0xFFFFFFFFu;
     ensure_capacity(s, n_con, bv.n);
     uint32_t* color = color_.data();
+    uint64_t* bpri  = body_pri_.data();
     uint64_t* bmask = body_mask_.data();
-    uint32_t* meta  = meta_.data();
-    q.memset(bmask, 0, static_cast<size_t>(bv.n) * sizeof(uint64_t));
-    q.memset(meta,  0, 2 * sizeof(uint32_t));
+    uint32_t* meta  = meta_.data();   // [max_color, overflow, remaining]
+    q.memset(color, 0xFF, static_cast<size_t>(n_con) * sizeof(uint32_t));  // all UNCOLORED
+    q.memset(bmask, 0,    static_cast<size_t>(bv.n) * sizeof(uint64_t));
+    parallel_for(s, 1, [meta, n_con](size_t) { meta[0] = 0; meta[1] = 0; meta[2] = n_con; });
 
-    // Deterministic greedy coloring: contacts [0,nc) then joints [nc,n_con).
-    // Only dynamic bodies (inv_mass>0) are conflict nodes; per-body 64-bit
-    // used-color mask; lowest free color via clz of the lowest set bit of ~used.
-    parallel_for(s, 1, [cv, jv, bv, color, bmask, meta, nc, n_con](size_t) {
-        uint32_t max_col = 0;
-        for (uint32_t k = 0; k < n_con; ++k) {
-            uint32_t a, b;
-            if (k < nc) { a = cv.body_a[k];        b = cv.body_b[k]; }
-            else        { a = jv.body_parent[k-nc]; b = jv.body_child[k-nc]; }
-            bool da = (bv.inv_mass[a] != 0.f);
-            bool db = (bv.inv_mass[b] != 0.f);
-            uint64_t used = (da ? bmask[a] : 0ull) | (db ? bmask[b] : 0ull);
-            uint64_t freebits = ~used;
-            uint32_t col;
-            if (freebits == 0ull) { col = 63u; meta[1] = 1u; }       // >64 colors: overflow
-            else {
-                uint64_t lowbit = freebits & (0ull - freebits);      // isolate lowest set bit
-                col = 63u - static_cast<uint32_t>(sycl::clz(lowbit));
-            }
-            color[k] = col;
-            uint64_t bit = (uint64_t)1 << col;
-            if (da) bmask[a] |= bit;
-            if (db) bmask[b] |= bit;
-            if (col > max_col) max_col = col;
+    constexpr uint32_t MAX_ROUNDS = 256;  // priority chains are short; ample headroom
+    constexpr uint32_t BATCH = 8;
+    uint32_t r = 0, h_rem = n_con;
+    while (h_rem > 0 && r < MAX_ROUNDS) {
+        for (uint32_t bi = 0; bi < BATCH && r < MAX_ROUNDS; ++bi, ++r) {
+            q.memset(bpri, 0, static_cast<size_t>(bv.n) * sizeof(uint64_t));
+            // Phase A: each uncoloured constraint posts its priority to its bodies.
+            parallel_for(s, n_con, [cv, jv, bv, color, bpri, nc](size_t kk) {
+                uint32_t k = static_cast<uint32_t>(kk);
+                if (color[k] != UNCOLORED) return;
+                uint32_t a, b;
+                if (k < nc) { a = cv.body_a[k];          b = cv.body_b[k]; }
+                else        { a = jv.body_parent[k-nc];  b = jv.body_child[k-nc]; }
+                uint64_t pk = (static_cast<uint64_t>(hash_u32(k)) << 32) | k;
+                if (bv.inv_mass[a] != 0.f) atomic_max_u64(&bpri[a], pk);
+                if (bv.inv_mass[b] != 0.f) atomic_max_u64(&bpri[b], pk);
+            });
+            // Phase B: priority-maxima take the lowest colour free of coloured
+            // neighbours. Same-round members touch disjoint dynamic bodies, so the
+            // neighbour mask read here is stable within the round.
+            parallel_for(s, n_con, [cv, jv, bv, color, bpri, bmask, meta, nc](size_t kk) {
+                uint32_t k = static_cast<uint32_t>(kk);
+                if (color[k] != UNCOLORED) return;
+                uint32_t a, b;
+                if (k < nc) { a = cv.body_a[k];          b = cv.body_b[k]; }
+                else        { a = jv.body_parent[k-nc];  b = jv.body_child[k-nc]; }
+                bool da = (bv.inv_mass[a] != 0.f), db = (bv.inv_mass[b] != 0.f);
+                uint64_t pk = (static_cast<uint64_t>(hash_u32(k)) << 32) | k;
+                if ((da && bpri[a] != pk) || (db && bpri[b] != pk)) return;  // not a local max
+                uint64_t used = (da ? bmask[a] : 0ull) | (db ? bmask[b] : 0ull);
+                uint64_t freebits = ~used;
+                if (freebits == 0ull) { meta[1] = 1u; return; }  // >64 colours: overflow
+                uint64_t lowbit = freebits & (0ull - freebits);
+                uint32_t col = 63u - static_cast<uint32_t>(sycl::clz(lowbit));
+                color[k] = col;
+                uint64_t bit = (uint64_t)1 << col;
+                if (da) atomic_or_u64(&bmask[a], bit);
+                if (db) atomic_or_u64(&bmask[b], bit);
+                atomic_max_u32(&meta[0], col);
+                atomic_dec_u32(&meta[2]);
+            });
         }
-        meta[0] = max_col + 1;
-    });
+        q.memcpy(&h_rem, meta + 2, sizeof(uint32_t)).wait();   // one sync per batch
+    }
 
-    uint32_t h_meta[2];
-    q.memcpy(h_meta, meta, 2 * sizeof(uint32_t)).wait();
-    uint32_t n_colors = h_meta[0];
-    if (h_meta[1]) {  // overflow (>64 colors on one body): safe sequential fallback
+    uint32_t h_over; q.memcpy(&h_over, meta + 1, sizeof(uint32_t)).wait();
+    if (h_rem > 0 || h_over) {  // >64 colours on a body, or didn't converge: serial
         run_serial(s, cv, jv, bv, ni, mu, lc, dt, nc, nj);
         return;
     }
+    uint32_t h_max; q.memcpy(&h_max, meta, sizeof(uint32_t)).wait();
+    uint32_t n_colors = h_max + 1;
 
-    // PD motor pre-pass — colored (joints only), one kernel per color.
-    for (uint32_t ci = 0; ci < n_colors; ++ci) {
-        parallel_for(s, n_con, [cv, jv, bv, color, dt, nc, ci](size_t k) {
-            if (color[k] != ci || k < nc) return;
-            uint32_t j = static_cast<uint32_t>(k) - nc;
-            uint8_t jtype = jv.type[j];
-            if (jtype == static_cast<uint8_t>(JointType::Revolute) ||
-                jtype == static_cast<uint8_t>(JointType::Prismatic)) {
-                apply_motor(bv, jv.body_parent[j], jv.body_child[j],
-                            jv.axis_px[j], jv.axis_py[j], jv.axis_pz[j],
-                            jv.target_pos[j], jv.target_vel[j],
-                            jv.stiffness[j], jv.damping[j], dt, jtype);
-            }
-        });
+    // PD motor pre-pass — colored (joints only), one kernel per color. Skipped
+    // entirely when the scene has no joints (the common rigid-body case): otherwise
+    // it dispatches n_colors × n_con no-op work-items every frame.
+    if (nj > 0) {
+        for (uint32_t ci = 0; ci < n_colors; ++ci) {
+            parallel_for(s, n_con, [cv, jv, bv, color, dt, nc, ci](size_t k) {
+                if (color[k] != ci || k < nc) return;
+                uint32_t j = static_cast<uint32_t>(k) - nc;
+                uint8_t jtype = jv.type[j];
+                if (jtype == static_cast<uint8_t>(JointType::Revolute) ||
+                    jtype == static_cast<uint8_t>(JointType::Prismatic)) {
+                    apply_motor(bv, jv.body_parent[j], jv.body_child[j],
+                                jv.axis_px[j], jv.axis_py[j], jv.axis_pz[j],
+                                jv.target_pos[j], jv.target_vel[j],
+                                jv.stiffness[j], jv.damping[j], dt, jtype);
+                }
+            });
+        }
     }
 
     // Gauss-Seidel across colors, parallel within a color (disjoint dynamic bodies).

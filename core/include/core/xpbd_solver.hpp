@@ -55,10 +55,18 @@ private:
     float            friction_;
     bool             force_serial_ = false;
     Buffer<float>    lambda_c_;
-    // Graph-colouring scratch (allocated lazily / grown on demand).
-    Buffer<uint32_t> color_;      // [n_constraints] colour per constraint
-    Buffer<uint64_t> body_mask_;  // [n_bodies] used-colour bitmask (≤64 colours)
-    Buffer<uint32_t> meta_;       // [2] = {n_colors, overflow_flag}
+    // Parallel graph-colouring scratch (allocated lazily / grown on demand).
+    // Jones–Plassmann/Luby: each round colours the constraints that hold the
+    // highest (hashed, hence pseudo-random) priority among the uncoloured
+    // constraints sharing each of their dynamic bodies — an independent set —
+    // giving each its lowest colour free of already-coloured neighbours. Random
+    // priorities break index chains ⇒ O(log n) rounds; deterministic because the
+    // priority is a fixed hash of the constraint index (packed with the index to
+    // break ties). ≤ Δ+1 colours.
+    Buffer<uint32_t> color_;      // [n_constraints] colour per constraint (or UNCOLORED)
+    Buffer<uint64_t> body_pri_;   // [n_bodies] max (hash<<32|idx) of uncoloured constraints at a body
+    Buffer<uint64_t> body_mask_;  // [n_bodies] used-colour bitmask of coloured neighbours (≤64)
+    Buffer<uint32_t> meta_;       // [3] = {max_color, overflow_flag, remaining_uncoloured}
 };
 
 } // namespace dyphur

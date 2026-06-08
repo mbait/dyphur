@@ -132,13 +132,19 @@ no two sharing a *dynamic* body get the same colour (static/kinematic bodies,
 box↔ground contacts collapse into a handful of colours). Within a colour, writes are
 disjoint ⇒ one parallel kernel, **no atomics**; colours run in queue order ⇒
 Gauss-Seidel across colours. Deterministic by construction (fixed colour order,
-disjoint writes), matching NVIDIA Newton/Warp and PhysX 5 TGS. Coloring is a
-single-work-item greedy pass (lowest free colour via a per-body 64-bit used-colour
-mask) run once per frame and amortised over `n_iters` parallel sweeps; scenes ≤
+disjoint writes), matching NVIDIA Newton/Warp and PhysX 5 TGS. Scenes ≤
 `kSerialThreshold` (256) constraints keep the serial path (small scenes / goldens
 unchanged). The solver dropped from ~9 ms to a small fraction of the frame; stress
 went ~101 → ~237 fps warm. Result hashes change (colour order ≠ contact-index order);
 goldens regenerated. See REPORT.md §4.5/§4.6.
+
+**Update (2026-06-08) — coloring parallelised.** The coloring was initially a
+single-work-item greedy pass (one GPU thread, lowest-free-colour via a per-body
+64-bit mask). Profiling later showed *that serial pass* was the solver's dominant
+cost at scale (≈5 ms of an 11 ms solve at 8 192 bodies, linear in constraint count).
+It is now a parallel Jones–Plassmann/Luby coloring with hashed priorities (§4.5.1),
+dropping the solver to ~3.7 ms at 8k (≈3×; 8k warm ~78 → ~135 fps). The motor pre-pass
+is also skipped when a scene has no joints. Run-to-run determinism holds at 1k/4k/8k.
 
 ### Update (2026-06-03) — narrowphase parallelised
 
